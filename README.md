@@ -1,20 +1,24 @@
 # dsh-tray
 
-DeepSeek Harness 的托盘启动器（原生、无依赖）
+DeepSeek Harness 的托盘启动器（原生、无依赖、跨平台）
 
-为 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) 的 Web GUI 提供一个「双击即用、无黑窗口」的 Windows 桌面入口：后台拉起 `dsh web`，端口就绪后自动打开浏览器，并常驻系统托盘。
+为 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) 的 Web GUI 提供一个「双击即用、无黑窗口」的桌面入口：后台拉起 `dsh web`，端口就绪后自动打开浏览器，并常驻系统托盘（Windows 托盘 / macOS 菜单栏）。
+
+图标使用 DeepSeek Harness 官方鲸鱼标志。
 
 ## 特性
 
-- **单文件原生 exe**：NativeAOT 编译，零 .NET 运行时依赖（约 2 MB）
-- **无控制台窗口**：纯 Win32（P/Invoke），不依赖 WinForms / Electron
+- **单文件原生可执行文件**：NativeAOT 编译，零 .NET 运行时依赖
+- **跨平台**：Windows（托盘）+ macOS（菜单栏），纯原生实现，不依赖 WinForms / Electron
 - **自动打开浏览器**：轮询端口，监听就绪后打开 `http://127.0.0.1:3080`
-- **系统托盘菜单**：打开网页 / 查看日志 / 退出并停止服务
+- **托盘菜单**：打开网页 / 查看日志 / 退出并停止服务
 - **单实例**：重复启动不冲突，而是让已运行实例重新打开浏览器
 
 ## 编译
 
-前置要求：.NET 8+ SDK，以及 MSVC C++ 工具链（Visual Studio Build Tools 的「使用 C++ 的桌面开发」工作负载）。
+### Windows
+
+前置要求：.NET 9 SDK + MSVC C++ 工具链（Visual Studio Build Tools 的「使用 C++ 的桌面开发」工作负载）。
 
 ```powershell
 dotnet publish -c Release -r win-x64
@@ -22,18 +26,34 @@ dotnet publish -c Release -r win-x64
 
 产物：`bin\Release\net9.0-windows\win-x64\publish\dsh-tray.exe`
 
-> `PublishAot` 已在 csproj 中开启，直接 `publish` 即得到自包含原生 exe。
+### macOS
+
+前置要求：.NET 9 SDK + Xcode 命令行工具。
+
+```bash
+dotnet workload install macos
+dotnet publish -c Release -r osx-arm64   # Apple Silicon
+dotnet publish -c Release -r osx-x64     # Intel
+```
+
+产物：`bin\Release\net9.0-macos\<rid>\publish\dsh-tray`
+
+> `PublishAot` 已在 csproj 中开启，直接 `publish` 即得到自包含原生可执行文件。
 
 ## 使用
 
 | 命令 | 说明 |
 |------|------|
-| `dsh-tray.exe` | 端口 3080，自动打开浏览器 |
-| `dsh-tray.exe --port 8080` | 自定义端口 |
-| `dsh-tray.exe --no-open` | 只起服务，不打开浏览器 |
-| `dsh-tray.exe --stop` | 优雅停止已运行的实例 |
+| `dsh-tray` | 端口 3080，自动打开浏览器 |
+| `dsh-tray --port 8080` | 自定义端口 |
+| `dsh-tray --no-open` | 只起服务，不打开浏览器 |
+| `dsh-tray --stop` | 优雅停止已运行的实例 |
 
-服务日志：`%TEMP%\dsh-tray-server.log`
+服务日志：Windows `%TEMP%\dsh-tray-server.log`，macOS `/tmp/dsh-tray-server.log`
+
+## 自动发布
+
+GitHub Actions 会在推送 `v*` tag 时自动编译 Windows（x64）与 macOS（arm64 / x64）三个原生产物，并创建 Release（见 `.github/workflows/release.yml`）。
 
 ## 依赖
 
