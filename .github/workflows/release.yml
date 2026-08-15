@@ -17,13 +17,13 @@ jobs:
         include:
           - os: windows-latest
             rid: win-x64
-            asset: dsh-tray-win-x64.exe
+            artifact: dsh-tray-win-x64.exe
           - os: macos-14
             rid: osx-arm64
-            asset: dsh-tray-osx-arm64
+            artifact: dsh-tray-osx-arm64.zip
           - os: macos-13
             rid: osx-x64
-            asset: dsh-tray-osx-x64
+            artifact: dsh-tray-osx-x64.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -42,17 +42,19 @@ jobs:
       - name: Collect artifact (Windows)
         if: runner.os == 'Windows'
         shell: bash
-        run: mv bin/Release/net9.0-windows/win-x64/publish/dsh-tray.exe ${{ matrix.asset }}
+        run: mv bin/Release/net9.0-windows/win-x64/publish/dsh-tray.exe ${{ matrix.artifact }}
 
       - name: Collect artifact (macOS)
         if: runner.os == 'macOS'
         shell: bash
-        run: mv bin/Release/net9.0-macos/${{ matrix.rid }}/publish/dsh-tray ${{ matrix.asset }}
+        run: |
+          cd bin/Release/net9.0-macos/${{ matrix.rid }}/publish
+          zip -r -y "$GITHUB_WORKSPACE/${{ matrix.artifact }}" .
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
 
   release:
     needs: build
