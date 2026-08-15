@@ -1,14 +1,14 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <!-- One TFM per host OS: builds on Windows target net9.0-windows, on macOS net9.0-macos. -->
-    <TargetFramework Condition="$([MSBuild]::IsOSPlatform('Windows'))">net9.0-windows</TargetFramework>
-    <TargetFramework Condition="$([MSBuild]::IsOSPlatform('OSX'))">net9.0-macos</TargetFramework>
+    <!-- One TFM per host OS: builds on Windows target net10.0-windows, on macOS net10.0-macos. -->
+    <TargetFramework Condition="$([MSBuild]::IsOSPlatform('Windows'))">net10.0-windows</TargetFramework>
+    <TargetFramework Condition="$([MSBuild]::IsOSPlatform('OSX'))">net10.0-macos</TargetFramework>
     <ImplicitUsings>disable</ImplicitUsings>
     <Nullable>disable</Nullable>
     <AssemblyName>dsh-tray</AssemblyName>
     <RootNamespace>DshTray</RootNamespace>
-    <Version>0.1.0</Version>
+    <Version>0.1.1</Version>
     <ApplicationId>io.dshtray.app</ApplicationId>
 
     <!-- macOS default: a mach-o executable (AppKit). Windows overrides to WinExe below. -->

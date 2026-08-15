@@ -27,7 +27,7 @@ jobs:
 
       - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '9.0.x'
+          dotnet-version: '10.0.x'
 
       - name: Install macOS workload
         if: runner.os == 'macOS'
@@ -42,24 +42,25 @@ jobs:
       - name: Publish
         run: dotnet publish -c Release -r ${{ matrix.rid }}
 
-      - name: Build NSIS installer (Windows)
+      - name: Build Inno Setup installer (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install nsis --no-progress -y
-          $candidates = @("C:\Program Files (x86)\NSIS\makensis.exe", "C:\Program Files\NSIS\makensis.exe")
-          $makensis = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $makensis) { Write-Error "makensis not found"; exit 1 }
-          # NSIS resolves File/OutFile relative to the script's directory
-          Copy-Item bin/Release/net9.0-windows/win-x64/publish/dsh-tray.exe .
-          & $makensis installer.nsi
+          choco install innosetup --no-progress -y
+          $candidates = @("C:\Program Files (x86)\Inno Setup 6\ISCC.exe", "C:\Program Files\Inno Setup 6\ISCC.exe")
+          $iscc = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source }
+          if (-not $iscc) { Write-Error "ISCC not found"; exit 1 }
+          # ISCC resolves Source/Output paths relative to the script's directory
+          Copy-Item bin/Release/net10.0-windows/win-x64/publish/dsh-tray.exe .
+          & $iscc installer.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Move-Item dsh-tray-setup.exe "$env:GITHUB_WORKSPACE/${{ matrix.artifact }}"
 
       - name: Package DMG (macOS)
         if: runner.os == 'macOS'
         shell: bash
-        run: bash scripts/package-macos.sh ${{ matrix.rid }} 0.1.0
+        run: bash scripts/package-macos.sh ${{ matrix.rid }} 0.1.1
 
       - uses: actions/upload-artifact@v4
         with:
