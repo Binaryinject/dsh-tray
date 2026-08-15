@@ -53,7 +53,13 @@ dotnet publish -c Release -r osx-x64     # Intel
 
 ## 自动发布
 
-GitHub Actions 会在推送 `v*` tag 时自动编译 Windows（x64）与 macOS（arm64 / x64）三个原生产物，并创建 Release（见 `.github/workflows/release.yml`）。
+GitHub Actions 会在推送 `v*` tag 时自动构建并创建 Release（见 `.github/workflows/release.yml`）：
+
+| 平台 | 产物 |
+|------|------|
+| Windows x64 | `dsh-tray-setup-win-x64.exe`（NSIS 安装包）|
+| macOS Apple Silicon | `dsh-tray-osx-arm64.dmg` |
+| macOS Intel | `dsh-tray-osx-x64.dmg` |
 
 ## 依赖
 
