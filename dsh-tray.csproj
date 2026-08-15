@@ -10,19 +10,21 @@
     <RootNamespace>DshTray</RootNamespace>
     <Version>0.1.0</Version>
 
+    <!-- macOS default: a mach-o executable (AppKit). Windows overrides to WinExe below. -->
+    <OutputType>Exe</OutputType>
     <SelfContained>true</SelfContained>
     <InvariantGlobalization>true</InvariantGlobalization>
-  </PropertyGroup>
 
-  <!-- Windows: NativeAOT (fully native binary, no runtime). macOS AppKit does not
-       support NativeAOT yet, so it falls back to a self-contained JIT build. -->
-  <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
-    <OutputType>WinExe</OutputType>
-    <ApplicationIcon>icon.ico</ApplicationIcon>
+    <!-- NativeAOT: supported on both Windows and macOS (AppKit, .NET 8+). -->
     <PublishAot>true</PublishAot>
     <OptimizationPreference>Size</OptimizationPreference>
     <StripSymbols>true</StripSymbols>
     <IlcGenerateStackTraceData>false</IlcGenerateStackTraceData>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
+    <OutputType>WinExe</OutputType>
+    <ApplicationIcon>icon.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>
