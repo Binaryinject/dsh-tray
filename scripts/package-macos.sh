@@ -6,18 +6,18 @@ set -euo pipefail
 RID="$1"
 VERSION="${2:-0.1.0}"
 
-PUB="bin/Release/net9.0-macos/$RID/publish"
+BASE="bin/Release/net9.0-macos"
 APP="dsh-tray.app"
 DMG="dsh-tray-$RID.dmg"
 
-echo "== publish dir =="
-ls -la "$PUB"
+echo "== output tree =="
+find "$BASE" -maxdepth 4 2>/dev/null || true
 
-# 1. Locate the built binary (bare executable or inside a .app bundle)
-BIN=$(find "$PUB" -type f -name 'dsh-tray' 2>/dev/null | head -1)
+# 1. Locate the built binary (the .NET macOS SDK may place it under the RID dir,
+#    with or without a publish/ subdirectory, bare or inside a .app bundle)
+BIN=$(find "$BASE" -type f -name 'dsh-tray' 2>/dev/null | head -1)
 if [ -z "$BIN" ]; then
-  echo "ERROR: dsh-tray binary not found under $PUB" >&2
-  find "$PUB" -maxdepth 6
+  echo "ERROR: dsh-tray binary not found under $BASE" >&2
   exit 1
 fi
 echo "binary: $BIN"
