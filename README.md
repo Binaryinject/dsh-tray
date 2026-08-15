@@ -59,7 +59,8 @@ GitHub Actions 会在推送 `v*` tag 时自动构建并创建 Release（见 `.gi
 |------|------|
 | Windows x64 | `dsh-tray-setup-win-x64.exe`（NSIS 安装包）|
 | macOS Apple Silicon | `dsh-tray-osx-arm64.dmg` |
-| macOS Intel | `dsh-tray-osx-x64.dmg` |
+
+> macOS 目前只构建 Apple Silicon（arm64）。Intel 版因 GitHub 已无配得上 .NET 9 的 Intel runner（Xcode 版本过旧），暂不提供。
 
 ## 依赖
 
