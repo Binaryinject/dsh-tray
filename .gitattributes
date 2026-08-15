@@ -1,0 +1,4 @@
+* text=auto
+
+# Mark binary files
+*.ico binary
