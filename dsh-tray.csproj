@@ -9,6 +9,7 @@
     <AssemblyName>dsh-tray</AssemblyName>
     <RootNamespace>DshTray</RootNamespace>
     <Version>0.1.0</Version>
+    <ApplicationId>io.dshtray.app</ApplicationId>
 
     <!-- macOS default: a mach-o executable (AppKit). Windows overrides to WinExe below. -->
     <OutputType>Exe</OutputType>
