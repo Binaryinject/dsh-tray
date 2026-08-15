@@ -40,6 +40,7 @@ namespace DshTray
             NSMenu menu = new NSMenu();
             menu.AddItem(MakeItem("打开网页", "openBrowser:", actions));
             menu.AddItem(MakeItem("查看日志", "openLog:", actions));
+            menu.AddItem(MakeItem("重启服务器", "restartServer:", actions));
             menu.AddItem(NSMenuItem.SeparatorItem);
             menu.AddItem(MakeItem("退出并停止服务", "quit:", actions));
             statusItem.Menu = menu;
@@ -107,6 +108,9 @@ namespace DshTray
 
             [Export("openLog:")]
             public void OpenLog(NSObject sender) { core.OpenLog(); }
+
+            [Export("restartServer:")]
+            public void RestartServer(NSObject sender) { core.RestartServer(); }
 
             [Export("quit:")]
             public void Quit(NSObject sender)

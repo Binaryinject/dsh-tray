@@ -149,6 +149,18 @@ namespace DshTray
             }
         }
 
+        public void RestartServer()
+        {
+            if (shuttingDown) return;
+
+            Action<string, string> cb = Notify;
+            if (cb != null) cb("DeepSeek Harness", "服务正在重启…");
+
+            StopServer();
+            StartServer();
+            if (autoOpen) StartPortWatcher();
+        }
+
         private void StartServer()
         {
             ProcessStartInfo psi = new ProcessStartInfo();
@@ -290,6 +302,7 @@ namespace DshTray
             if (server == null) return;
             try
             {
+                server.Exited -= OnServerExited;
                 if (!server.HasExited)
                 {
 #if WINDOWS

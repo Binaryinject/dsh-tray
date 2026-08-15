@@ -19,7 +19,8 @@ namespace DshTray
 
         private const int ID_OPEN = 1001;
         private const int ID_LOG = 1002;
-        private const int ID_EXIT = 1003;
+        private const int ID_RESTART = 1003;
+        private const int ID_EXIT = 1004;
 
         private const uint MF_STRING = 0x0000;
         private const uint MF_SEPARATOR = 0x0800;
@@ -125,6 +126,7 @@ namespace DshTray
                 int id = (int)((long)wParam & 0xffff);
                 if (id == ID_OPEN) core.OpenBrowser();
                 else if (id == ID_LOG) core.OpenLog();
+                else if (id == ID_RESTART) core.RestartServer();
                 else if (id == ID_EXIT) Shutdown();
                 return IntPtr.Zero;
             }
@@ -165,6 +167,7 @@ namespace DshTray
             IntPtr menu = CreatePopupMenu();
             AppendMenu(menu, MF_STRING, (uint)ID_OPEN, "打开网页");
             AppendMenu(menu, MF_STRING, (uint)ID_LOG, "查看日志");
+            AppendMenu(menu, MF_STRING, (uint)ID_RESTART, "重启服务器");
             AppendMenu(menu, MF_SEPARATOR, 0, null);
             AppendMenu(menu, MF_STRING, (uint)ID_EXIT, "退出并停止服务");
 

@@ -1,6 +1,6 @@
 ; dsh-tray Windows installer (per-user, no admin/UAC required)
 #define MyAppName "DeepSeek Harness Tray"
-#define MyAppVersion "0.1.1"
+#define MyAppVersion "0.1.2"
 #define MyAppPublisher "dsh-tray"
 #define MyAppExeName "dsh-tray.exe"
 
