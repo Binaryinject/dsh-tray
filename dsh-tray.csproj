@@ -10,18 +10,19 @@
     <RootNamespace>DshTray</RootNamespace>
     <Version>0.1.0</Version>
 
-    <!-- NativeAOT: fully self-contained native binary, no .NET runtime dependency -->
-    <PublishAot>true</PublishAot>
     <SelfContained>true</SelfContained>
     <InvariantGlobalization>true</InvariantGlobalization>
-    <OptimizationPreference>Size</OptimizationPreference>
-    <StripSymbols>true</StripSymbols>
-    <IlcGenerateStackTraceData>false</IlcGenerateStackTraceData>
   </PropertyGroup>
 
+  <!-- Windows: NativeAOT (fully native binary, no runtime). macOS AppKit does not
+       support NativeAOT yet, so it falls back to a self-contained JIT build. -->
   <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
     <OutputType>WinExe</OutputType>
     <ApplicationIcon>icon.ico</ApplicationIcon>
+    <PublishAot>true</PublishAot>
+    <OptimizationPreference>Size</OptimizationPreference>
+    <StripSymbols>true</StripSymbols>
+    <IlcGenerateStackTraceData>false</IlcGenerateStackTraceData>
   </PropertyGroup>
 
   <ItemGroup>

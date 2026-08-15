@@ -11,24 +11,30 @@ APP="dsh-tray.app"
 DMG="dsh-tray-$RID.dmg"
 
 echo "== output tree =="
-find "$BASE" -maxdepth 4 2>/dev/null || true
+find "$BASE" -maxdepth 5 2>/dev/null || true
 
-# 1. Locate the built binary (the .NET macOS SDK may place it under the RID dir,
-#    with or without a publish/ subdirectory, bare or inside a .app bundle)
-BIN=$(find "$BASE" -type f -name 'dsh-tray' 2>/dev/null | head -1)
-if [ -z "$BIN" ]; then
-  echo "ERROR: dsh-tray binary not found under $BASE" >&2
-  exit 1
-fi
-echo "binary: $BIN"
-
-# 2. Assemble a fresh .app bundle
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$BIN" "$APP/Contents/MacOS/dsh-tray"
-chmod +x "$APP/Contents/MacOS/dsh-tray"
 
-# 3. Info.plist (LSUIElement => menu-bar only, no dock icon)
+# 1. Locate the publish output: a prebuilt .app bundle, or a self-contained
+#    folder containing the dsh-tray executable (+ its runtime files).
+BUNDLE=$(find "$BASE" -type d -name 'dsh-tray.app' 2>/dev/null | head -1)
+if [ -n "$BUNDLE" ]; then
+  echo "using bundle: $BUNDLE"
+  cp -R "$BUNDLE" "$APP"
+else
+  BIN=$(find "$BASE" -type f -name 'dsh-tray' 2>/dev/null | head -1)
+  if [ -z "$BIN" ]; then
+    echo "ERROR: neither dsh-tray.app nor dsh-tray binary found under $BASE" >&2
+    exit 1
+  fi
+  echo "using binary dir: $(dirname "$BIN")"
+  mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+  cp -R "$(dirname "$BIN")/." "$APP/Contents/MacOS/"
+  chmod +x "$APP/Contents/MacOS/dsh-tray"
+fi
+
+# 2. Info.plist (LSUIElement => menu-bar only, no dock icon)
+mkdir -p "$APP/Contents"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -47,7 +53,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# 4. Icon (.icns) from the high-res master — best effort, never fatal
+# 3. Icon (.icns) from the high-res master — best effort, never fatal
+mkdir -p "$APP/Contents/Resources"
 (
   set +e
   if [ -f icon-1024.png ] && command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1; then
@@ -63,7 +70,7 @@ PLIST
   fi
 ) || true
 
-# 5. DMG with an Applications symlink (drag-to-install)
+# 4. DMG with an Applications symlink (drag-to-install)
 rm -f "$DMG"
 STAGE="dmg-stage"
 rm -rf "$STAGE"
