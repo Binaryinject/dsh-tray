@@ -44,9 +44,12 @@ jobs:
         shell: pwsh
         run: |
           choco install nsis --no-progress -y
-          refreshenv
+          $candidates = @("C:\Program Files (x86)\NSIS\makensis.exe", "C:\Program Files\NSIS\makensis.exe")
+          $makensis = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $makensis) { Write-Error "makensis not found"; exit 1 }
           cd bin/Release/net9.0-windows/win-x64/publish
-          makensis "$env:GITHUB_WORKSPACE/installer.nsi"
+          & $makensis "$env:GITHUB_WORKSPACE/installer.nsi"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Move-Item dsh-tray-setup.exe "$env:GITHUB_WORKSPACE/${{ matrix.artifact }}"
 
       - name: Package DMG (macOS)
