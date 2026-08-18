@@ -1,5 +1,6 @@
 #if MACOS
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using AppKit;
@@ -49,9 +50,13 @@ namespace DshTray
             {
                 app.BeginInvokeOnMainThread(delegate { Shutdown(); });
             };
-            c.Notify = delegate
+            c.Notify = delegate(string title, string text)
             {
-                // macOS notification is optional; skipped for now.
+                ShowNotification(title, text);
+            };
+            c.StatusChanged = delegate (string status)
+            {
+                // Status progress is delivered through notification banners on macOS.
             };
 
             c.Start();
@@ -72,6 +77,30 @@ namespace DshTray
         {
             core.Shutdown();
             NSApplication.SharedApplication.Terminate(null);
+        }
+
+        private static void ShowNotification(string title, string text)
+        {
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo();
+                psi.FileName = "/usr/bin/osascript";
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.ArgumentList.Add("-e");
+                psi.ArgumentList.Add("display notification " + QuoteForAppleScript(text) + " with title " + QuoteForAppleScript(title));
+                Process p = Process.Start(psi);
+                if (p != null) p.Dispose();
+            }
+            catch
+            {
+            }
+        }
+
+        private static string QuoteForAppleScript(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return "\"\"";
+            return "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
         }
 
         private static NSImage LoadImage()

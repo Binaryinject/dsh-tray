@@ -87,12 +87,24 @@ namespace DshTray
         private Process server;
         private StreamWriter logWriter;
         private volatile bool shuttingDown;
+        private readonly object downloadNoticeLock = new object();
+        private volatile bool downloadInstallNoticeShown;
+        private int downloadStepCount;
+        private int portWatcherGeneration;
+
+        private const int SlowStartNoticeSeconds = 15;
+        private const int DownloadProgressNoticeSeconds = 30;
+        private const int LongStartNoticeSeconds = 120;
+        private const int LongStartNoticeIntervalSeconds = 120;
 
         /// <summary>Invoked (on the platform UI thread) when a "stop" command is received.</summary>
         public Action OnShutdownRequest;
 
-        /// <summary>Invoked to surface a notification (title, text) on server exit.</summary>
+        /// <summary>Invoked to surface a notification (title, text). May be called from background threads.</summary>
         public Action<string, string> Notify;
+
+        /// <summary>Invoked to update a persistent status display (e.g. tray tooltip). May be called from background threads.</summary>
+        public Action<string> StatusChanged;
 
         public bool ShuttingDown { get { return shuttingDown; } }
         public string Url { get { return "http://127.0.0.1:" + port; } }
@@ -107,7 +119,7 @@ namespace DshTray
         public void Start()
         {
             StartServer();
-            if (autoOpen) StartPortWatcher();
+            StartPortWatcher();
             StartCommandListener();
         }
 
@@ -155,21 +167,28 @@ namespace DshTray
 
             Action<string, string> cb = Notify;
             if (cb != null) cb("DeepSeek Harness", "服务正在重启…");
+            UpdateStatus("DeepSeek Harness — 服务正在重启…");
 
             StopServer();
             StartServer();
-            if (autoOpen) StartPortWatcher();
+            StartPortWatcher();
         }
 
         private void StartServer()
         {
+            downloadInstallNoticeShown = false;
+            downloadStepCount = 0;
+            UpdateStatus("DeepSeek Harness — 服务正在启动…");
+
             ProcessStartInfo psi = new ProcessStartInfo();
 #if WINDOWS
             psi.FileName = "cmd.exe";
-            psi.Arguments = "/c npx --yes @deepseek-ai/dsh web --port " + port;
+            // --loglevel http makes npm emit fetch/cache-miss lines even when
+            // stderr is redirected, so the tray can report downloads.
+            psi.Arguments = "/c npx --yes --loglevel http @deepseek-ai/dsh web --port " + port;
 #else
             psi.FileName = "/bin/sh";
-            psi.Arguments = "-c \"npx --yes @deepseek-ai/dsh web --port " + port + "\"";
+            psi.Arguments = "-c \"npx --yes --loglevel http @deepseek-ai/dsh web --port " + port + "\"";
 #endif
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;
@@ -190,8 +209,8 @@ namespace DshTray
                 logWriter = null;
             }
 
-            server.OutputDataReceived += delegate(object s, DataReceivedEventArgs e) { Log(e.Data); };
-            server.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e) { Log(e.Data); };
+            server.OutputDataReceived += delegate (object s, DataReceivedEventArgs e) { Log(e.Data); };
+            server.ErrorDataReceived += delegate (object s, DataReceivedEventArgs e) { Log(e.Data); };
 
             server.Start();
             server.BeginOutputReadLine();
@@ -200,7 +219,12 @@ namespace DshTray
 
         private void Log(string line)
         {
-            if (line == null || logWriter == null) return;
+            if (line == null) return;
+
+            CheckServerOutput(line);
+            TrackDownloadProgress(line);
+            if (logWriter == null) return;
+
             try
             {
                 lock (logWriter)
@@ -214,23 +238,127 @@ namespace DshTray
             }
         }
 
+        /// <summary>
+        /// npx prints a warning when @deepseek-ai/dsh is not cached (first run)
+        /// or needs to be fetched again. Surface that immediately, otherwise the
+        /// user only sees a silent, multi-minute startup.
+        /// </summary>
+        private void CheckServerOutput(string line)
+        {
+            lock (downloadNoticeLock)
+            {
+                if (downloadInstallNoticeShown) return;
+
+                // npm < 11 prints "will be installed" when npx has to fetch a package;
+                // npm >= 11 stays quiet unless loglevel is http, then cache misses are visible.
+                bool olderNpmInstallNotice = line.IndexOf("will be installed", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool fetchWithCacheMiss = line.IndexOf("npm http fetch GET", StringComparison.OrdinalIgnoreCase) >= 0
+                    && line.IndexOf("cache miss", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                if (!olderNpmInstallNotice && !fetchWithCacheMiss) return;
+
+                downloadInstallNoticeShown = true;
+                downloadStepCount = 0;
+            }
+
+            NotifyUser("检测到 dsh 需要安装/更新，正在后台下载，请稍候…");
+            UpdateStatus("DeepSeek Harness — 正在下载/更新 dsh…");
+        }
+
+        /// <summary>Counts fetched tarballs after a download/update has been detected.</summary>
+        private void TrackDownloadProgress(string line)
+        {
+            if (!downloadInstallNoticeShown) return;
+            if (line.IndexOf("npm http fetch GET", StringComparison.OrdinalIgnoreCase) < 0) return;
+            if (line.IndexOf(".tgz", StringComparison.OrdinalIgnoreCase) < 0) return;
+
+            int count = Interlocked.Increment(ref downloadStepCount);
+            UpdateStatus("DeepSeek Harness — 正在下载/更新 dsh：已获取 " + count + " 个包");
+        }
+
+        private void NotifyUser(string text)
+        {
+            Action<string, string> cb = Notify;
+            if (cb != null) cb("DeepSeek Harness", text);
+        }
+
+        private void UpdateStatus(string text)
+        {
+            Action<string> cb = StatusChanged;
+            if (cb != null) cb(text);
+        }
+
         private void StartPortWatcher()
         {
-            Thread t = new Thread(delegate()
+            int generation = Interlocked.Increment(ref portWatcherGeneration);
+
+            Thread t = new Thread(delegate ()
             {
-                for (int i = 0; i < 240; i++)
+                DateTime started = DateTime.UtcNow;
+                bool slowStartNoticeShown = false;
+                double lastDownloadProgressNotice = -1;
+                double lastLongStartNotice = -1;
+
+                while (true)
                 {
-                    if (shuttingDown) return;
+                    if (shuttingDown || generation != portWatcherGeneration) return;
                     if (PortIsOpen())
                     {
-                        OpenBrowser();
+                        if (shuttingDown || generation != portWatcherGeneration) return;
+                        if (autoOpen) OpenBrowser();
+                        else if (downloadInstallNoticeShown)
+                        {
+                            int downloaded = Volatile.Read(ref downloadStepCount);
+                            NotifyUser("dsh 下载/更新完成，服务已就绪（共获取 " + downloaded + " 个包）。");
+                        }
+                        else
+                        {
+                            NotifyUser("服务已就绪。");
+                        }
+                        UpdateStatus("DeepSeek Harness");
                         return;
                     }
+
+                    // npx failed fast: OnServerExited has already told the user;
+                    // do not keep polling and later fire a misleading timeout notice.
+                    Process s = server;
+                    if (s != null && s.HasExited) return;
+
+                    double elapsed = (DateTime.UtcNow - started).TotalSeconds;
+                    if (!slowStartNoticeShown && elapsed >= SlowStartNoticeSeconds)
+                    {
+                        slowStartNoticeShown = true;
+                        NotifyUser("服务仍在启动：dsh 可能正在下载/更新，请稍候…");
+                    }
+                    else if (downloadInstallNoticeShown
+                        && elapsed >= DownloadProgressNoticeSeconds
+                        && (lastDownloadProgressNotice < 0 || elapsed - lastDownloadProgressNotice >= DownloadProgressNoticeSeconds))
+                    {
+                        lastDownloadProgressNotice = elapsed;
+                        int downloaded = Volatile.Read(ref downloadStepCount);
+                        NotifyUser("正在下载/更新 dsh：已获取 " + downloaded + " 个包，已等待 " + FormatWaitTime(elapsed) + "。请稍候…");
+                    }
+                    else if (!downloadInstallNoticeShown && elapsed >= LongStartNoticeSeconds
+                        && (lastLongStartNotice < 0 || elapsed - lastLongStartNotice >= LongStartNoticeIntervalSeconds))
+                    {
+                        lastLongStartNotice = elapsed;
+                        int minutes = (int)(elapsed / 60);
+                        NotifyUser("服务仍在启动（已等待 " + minutes + " 分钟），dsh 可能仍在下载/更新。请耐心等待，可点击『查看日志』了解进度。");
+                    }
+
                     Thread.Sleep(500);
                 }
             });
             t.IsBackground = true;
             t.Start();
+        }
+
+
+        private static string FormatWaitTime(double totalSeconds)
+        {
+            int seconds = (int)totalSeconds;
+            if (seconds < 60) return seconds + " 秒";
+            return (seconds / 60) + " 分钟";
         }
 
         private bool PortIsOpen()
@@ -258,7 +386,7 @@ namespace DshTray
 
         private void StartCommandListener()
         {
-            Thread t = new Thread(delegate()
+            Thread t = new Thread(delegate ()
             {
                 while (!shuttingDown)
                 {
@@ -293,6 +421,7 @@ namespace DshTray
         private void OnServerExited(object sender, EventArgs e)
         {
             if (shuttingDown) return;
+            UpdateStatus("DeepSeek Harness");
             Action<string, string> cb = Notify;
             if (cb != null) cb("DeepSeek Harness", "服务已退出，详情见日志。");
         }

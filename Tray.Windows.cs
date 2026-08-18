@@ -1,5 +1,6 @@
 #if WINDOWS
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -16,6 +17,8 @@ namespace DshTray
         private const uint WM_RBUTTONUP = 0x0205;
         private const uint WM_TRAYICON = 0x0401;
         private const uint WM_APP_EXIT = 0x8001;
+        private const uint WM_APP_NOTIFY = 0x8002;
+        private const uint WM_APP_STATUS = 0x8003;
 
         private const int ID_OPEN = 1001;
         private const int ID_LOG = 1002;
@@ -49,6 +52,10 @@ namespace DshTray
         private static IntPtr hwnd;
         private static IntPtr hIcon;
         private static readonly object trayLock = new object();
+        private static readonly object notificationLock = new object();
+        private static readonly object statusLock = new object();
+        private static string pendingStatus;
+        private static readonly Queue<Tuple<string, string>> pendingNotifications = new Queue<Tuple<string, string>>();
 
         public static int Run(Core c)
         {
@@ -56,7 +63,8 @@ namespace DshTray
             if (!CreateWindowAndTray()) return 1;
 
             c.OnShutdownRequest = delegate { PostMessage(hwnd, WM_APP_EXIT, IntPtr.Zero, IntPtr.Zero); };
-            c.Notify = delegate(string title, string text) { ShowBalloon(title, text, NIIF_WARNING); };
+            c.Notify = QueueNotification;
+            c.StatusChanged = QueueStatus;
 
             c.Start();
             ShowBalloon("DeepSeek Harness", "服务正在启动。", NIIF_INFO);
@@ -137,6 +145,18 @@ namespace DshTray
                 return IntPtr.Zero;
             }
 
+            if (msg == WM_APP_NOTIFY)
+            {
+                DrainNotifications();
+                return IntPtr.Zero;
+            }
+
+            if (msg == WM_APP_STATUS)
+            {
+                DrainStatus();
+                return IntPtr.Zero;
+            }
+
             if (msg == WM_DESTROY)
             {
                 PostQuitMessage(0);
@@ -179,6 +199,78 @@ namespace DshTray
             DestroyMenu(menu);
         }
 
+        private static void QueueNotification(string title, string text)
+        {
+            lock (notificationLock)
+            {
+                pendingNotifications.Enqueue(Tuple.Create(title, text));
+            }
+
+            // Core can call Notify from npx output / port-watcher threads, so marshal
+            // the actual Shell_NotifyIcon call back to the tray window's UI thread.
+            if (hwnd != IntPtr.Zero) PostMessage(hwnd, WM_APP_NOTIFY, IntPtr.Zero, IntPtr.Zero);
+        }
+
+        private static void DrainNotifications()
+        {
+            while (true)
+            {
+                Tuple<string, string> n;
+                lock (notificationLock)
+                {
+                    if (pendingNotifications.Count == 0) return;
+                    n = pendingNotifications.Dequeue();
+                }
+                ShowBalloon(n.Item1, n.Item2, NIIF_INFO);
+            }
+        }
+
+
+        private static void QueueStatus(string text)
+        {
+            lock (statusLock)
+            {
+                pendingStatus = text;
+            }
+
+            // Same marshalling pattern as notifications: the tooltip update must
+            // run on the thread that owns the tray window.
+            if (hwnd != IntPtr.Zero) PostMessage(hwnd, WM_APP_STATUS, IntPtr.Zero, IntPtr.Zero);
+        }
+
+        private static void DrainStatus()
+        {
+            string text;
+            lock (statusLock)
+            {
+                text = pendingStatus;
+                pendingStatus = null;
+            }
+            if (text != null) UpdateTooltip(text);
+        }
+
+        private static void UpdateTooltip(string text)
+        {
+            try
+            {
+                if (text.Length > 127) text = text.Substring(0, 127);
+
+                NOTIFYICONDATA nid = new NOTIFYICONDATA();
+                nid.cbSize = (uint)Marshal.SizeOf<NOTIFYICONDATA>();
+                nid.hWnd = hwnd;
+                nid.uID = 1;
+                nid.uFlags = NIF_TIP;
+                nid.szTip = text;
+
+                lock (trayLock)
+                {
+                    Shell_NotifyIcon(NIM_MODIFY, ref nid);
+                }
+            }
+            catch
+            {
+            }
+        }
         private static void ShowBalloon(string title, string text, uint flags)
         {
             try
