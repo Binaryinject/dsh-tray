@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
@@ -84,18 +85,18 @@ namespace DshTray
         private readonly int port;
         private readonly bool autoOpen;
         private readonly string logPath;
+        private readonly string latestLogPath;
+        private readonly object logLock = new object();
         private Process server;
         private StreamWriter logWriter;
         private volatile bool shuttingDown;
         private readonly object downloadNoticeLock = new object();
         private volatile bool downloadInstallNoticeShown;
+        private volatile bool installRequired;
         private int downloadStepCount;
+        private DateTime lastNpmActivityUtc;
+        private string updateProgressStage;
         private int portWatcherGeneration;
-
-        private const int SlowStartNoticeSeconds = 15;
-        private const int DownloadProgressNoticeSeconds = 30;
-        private const int LongStartNoticeSeconds = 120;
-        private const int LongStartNoticeIntervalSeconds = 120;
 
         /// <summary>Invoked (on the platform UI thread) when a "stop" command is received.</summary>
         public Action OnShutdownRequest;
@@ -106,6 +107,15 @@ namespace DshTray
         /// <summary>Invoked to update a persistent status display (e.g. tray tooltip). May be called from background threads.</summary>
         public Action<string> StatusChanged;
 
+        /// <summary>Invoked with the current update stage and latest output line.</summary>
+        public Action<string, string> UpdateProgressChanged;
+
+        /// <summary>Invoked once when a new dependency check/update begins.</summary>
+        public Action UpdateProgressStarted;
+
+        /// <summary>Invoked when an installation/update has completed and the service is ready.</summary>
+        public Action UpdateProgressCompleted;
+
         public bool ShuttingDown { get { return shuttingDown; } }
         public string Url { get { return "http://127.0.0.1:" + port; } }
 
@@ -114,6 +124,7 @@ namespace DshTray
             this.port = port;
             this.autoOpen = autoOpen;
             this.logPath = Path.Combine(Path.GetTempPath(), "dsh-tray-server.log");
+            this.latestLogPath = Path.Combine(Path.GetTempPath(), "dsh-tray-server-latest.log");
         }
 
         public void Start()
@@ -149,11 +160,29 @@ namespace DshTray
         {
             try
             {
-                if (!File.Exists(logPath)) File.WriteAllText(logPath, "");
+                lock (logLock)
+                {
+                    if (!File.Exists(logPath)) File.WriteAllText(logPath, "");
+                    if (logWriter != null) logWriter.Flush();
+
+                    List<string> lineList = new List<string>();
+                    using (FileStream stream = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                    using (StreamReader reader = new StreamReader(stream))
+                    {
+                        string line;
+                        while ((line = reader.ReadLine()) != null) lineList.Add(line);
+                    }
+                    string[] lines = lineList.ToArray();
+                    Array.Reverse(lines);
+                    File.WriteAllLines(latestLogPath, lines);
+                }
 #if WINDOWS
-                Process.Start(new ProcessStartInfo(logPath) { UseShellExecute = true });
+                ProcessStartInfo viewer = new ProcessStartInfo("notepad.exe");
+                viewer.UseShellExecute = false;
+                viewer.ArgumentList.Add(latestLogPath);
+                Process.Start(viewer);
 #else
-                Process.Start(new ProcessStartInfo("open", logPath) { UseShellExecute = false });
+                Process.Start(new ProcessStartInfo("open", latestLogPath) { UseShellExecute = false });
 #endif
             }
             catch
@@ -165,8 +194,6 @@ namespace DshTray
         {
             if (shuttingDown) return;
 
-            Action<string, string> cb = Notify;
-            if (cb != null) cb("DeepSeek Harness", "服务正在重启…");
             UpdateStatus("DeepSeek Harness — 服务正在重启…");
 
             StopServer();
@@ -177,7 +204,10 @@ namespace DshTray
         private void StartServer()
         {
             downloadInstallNoticeShown = false;
+            installRequired = false;
             downloadStepCount = 0;
+            lastNpmActivityUtc = DateTime.MinValue;
+            updateProgressStage = null;
             UpdateStatus("DeepSeek Harness — 服务正在启动…");
 
             ProcessStartInfo psi = new ProcessStartInfo();
@@ -194,6 +224,8 @@ namespace DshTray
             psi.CreateNoWindow = true;
             psi.RedirectStandardOutput = true;
             psi.RedirectStandardError = true;
+            psi.RedirectStandardInput = true;
+            psi.EnvironmentVariables["npm_config_yes"] = "true";
 
             server = new Process();
             server.StartInfo = psi;
@@ -213,6 +245,9 @@ namespace DshTray
             server.ErrorDataReceived += delegate (object s, DataReceivedEventArgs e) { Log(e.Data); };
 
             server.Start();
+            // npx also receives npm_config_yes=true. Closing stdin guarantees that
+            // an incompatible npx version cannot leave the hidden process waiting.
+            server.StandardInput.Close();
             server.BeginOutputReadLine();
             server.BeginErrorReadLine();
         }
@@ -223,11 +258,12 @@ namespace DshTray
 
             CheckServerOutput(line);
             TrackDownloadProgress(line);
+            if (downloadInstallNoticeShown) ReportUpdateProgress(null, line);
             if (logWriter == null) return;
 
             try
             {
-                lock (logWriter)
+                lock (logLock)
                 {
                     logWriter.WriteLine(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + line);
                     logWriter.Flush();
@@ -239,41 +275,48 @@ namespace DshTray
         }
 
         /// <summary>
-        /// npx prints a warning when @deepseek-ai/dsh is not cached (first run)
-        /// or needs to be fetched again. Surface that immediately, otherwise the
-        /// user only sees a silent, multi-minute startup.
+        /// Surface npm dependency activity immediately; cache revalidation can
+        /// take minutes even when no package update is ultimately required.
         /// </summary>
         private void CheckServerOutput(string line)
         {
             lock (downloadNoticeLock)
             {
-                if (downloadInstallNoticeShown) return;
-
-                // npm < 11 prints "will be installed" when npx has to fetch a package;
-                // npm >= 11 stays quiet unless loglevel is http, then cache misses are visible.
-                bool olderNpmInstallNotice = line.IndexOf("will be installed", StringComparison.OrdinalIgnoreCase) >= 0;
-                bool fetchWithCacheMiss = line.IndexOf("npm http fetch GET", StringComparison.OrdinalIgnoreCase) >= 0
-                    && line.IndexOf("cache miss", StringComparison.OrdinalIgnoreCase) >= 0;
-
-                if (!olderNpmInstallNotice && !fetchWithCacheMiss) return;
+                bool installNotice = line.IndexOf("will be installed", StringComparison.OrdinalIgnoreCase) >= 0
+                    || line.IndexOf("Need to install", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool npmFetch = line.IndexOf("npm http fetch GET", StringComparison.OrdinalIgnoreCase) >= 0;
+                if (installNotice) installRequired = true;
+                if (downloadInstallNoticeShown || (!installNotice && !npmFetch)) return;
 
                 downloadInstallNoticeShown = true;
                 downloadStepCount = 0;
+                lastNpmActivityUtc = DateTime.UtcNow;
             }
 
-            NotifyUser("检测到 dsh 需要安装/更新，正在后台下载，请稍候…");
-            UpdateStatus("DeepSeek Harness — 正在下载/更新 dsh…");
+            UpdateStatus("DeepSeek Harness — 正在检查 dsh 依赖…");
+            Action started = UpdateProgressStarted;
+            if (started != null) started();
+            ReportUpdateProgress("正在检查并解析依赖…", line);
         }
 
-        /// <summary>Counts fetched tarballs after a download/update has been detected.</summary>
+        /// <summary>Tracks npm network activity and completed tarball fetches.</summary>
         private void TrackDownloadProgress(string line)
         {
             if (!downloadInstallNoticeShown) return;
             if (line.IndexOf("npm http fetch GET", StringComparison.OrdinalIgnoreCase) < 0) return;
-            if (line.IndexOf(".tgz", StringComparison.OrdinalIgnoreCase) < 0) return;
 
-            int count = Interlocked.Increment(ref downloadStepCount);
-            UpdateStatus("DeepSeek Harness — 正在下载/更新 dsh：已获取 " + count + " 个包");
+            lock (downloadNoticeLock)
+            {
+                lastNpmActivityUtc = DateTime.UtcNow;
+            }
+
+            if (line.IndexOf(".tgz", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                installRequired = true;
+                int count = Interlocked.Increment(ref downloadStepCount);
+                UpdateStatus("DeepSeek Harness — 正在下载 dsh：已完成 " + count + " 个软件包");
+                ReportUpdateProgress("正在下载软件包（已完成 " + count + " 个）…", null);
+            }
         }
 
         private void NotifyUser(string text)
@@ -294,10 +337,8 @@ namespace DshTray
 
             Thread t = new Thread(delegate ()
             {
-                DateTime started = DateTime.UtcNow;
-                bool slowStartNoticeShown = false;
-                double lastDownloadProgressNotice = -1;
-                double lastLongStartNotice = -1;
+                int packageCountAtLastPhaseChange = -1;
+                bool installingStatusShown = false;
 
                 while (true)
                 {
@@ -305,16 +346,27 @@ namespace DshTray
                     if (PortIsOpen())
                     {
                         if (shuttingDown || generation != portWatcherGeneration) return;
-                        if (autoOpen) OpenBrowser();
-                        else if (downloadInstallNoticeShown)
+                        if (downloadInstallNoticeShown)
                         {
                             int downloaded = Volatile.Read(ref downloadStepCount);
-                            NotifyUser("dsh 下载/更新完成，服务已就绪（共获取 " + downloaded + " 个包）。");
+                            if (installRequired)
+                            {
+                                NotifyUser("dsh 更新完成，服务已启动（下载了 " + downloaded + " 个软件包）。");
+                                ReportUpdateProgress("更新完成，服务已就绪。", null);
+                            }
+                            else
+                            {
+                                NotifyUser("依赖检查完成，服务已启动。");
+                                ReportUpdateProgress("依赖检查完成，服务已就绪。", null);
+                            }
+                            Action completed = UpdateProgressCompleted;
+                            if (completed != null) completed();
                         }
                         else
                         {
-                            NotifyUser("服务已就绪。");
+                            NotifyUser("服务已启动并就绪。");
                         }
+                        if (autoOpen) OpenBrowser();
                         UpdateStatus("DeepSeek Harness");
                         return;
                     }
@@ -324,26 +376,22 @@ namespace DshTray
                     Process s = server;
                     if (s != null && s.HasExited) return;
 
-                    double elapsed = (DateTime.UtcNow - started).TotalSeconds;
-                    if (!slowStartNoticeShown && elapsed >= SlowStartNoticeSeconds)
+                    if (downloadInstallNoticeShown)
                     {
-                        slowStartNoticeShown = true;
-                        NotifyUser("服务仍在启动：dsh 可能正在下载/更新，请稍候…");
-                    }
-                    else if (downloadInstallNoticeShown
-                        && elapsed >= DownloadProgressNoticeSeconds
-                        && (lastDownloadProgressNotice < 0 || elapsed - lastDownloadProgressNotice >= DownloadProgressNoticeSeconds))
-                    {
-                        lastDownloadProgressNotice = elapsed;
-                        int downloaded = Volatile.Read(ref downloadStepCount);
-                        NotifyUser("正在下载/更新 dsh：已获取 " + downloaded + " 个包，已等待 " + FormatWaitTime(elapsed) + "。请稍候…");
-                    }
-                    else if (!downloadInstallNoticeShown && elapsed >= LongStartNoticeSeconds
-                        && (lastLongStartNotice < 0 || elapsed - lastLongStartNotice >= LongStartNoticeIntervalSeconds))
-                    {
-                        lastLongStartNotice = elapsed;
-                        int minutes = (int)(elapsed / 60);
-                        NotifyUser("服务仍在启动（已等待 " + minutes + " 分钟），dsh 可能仍在下载/更新。请耐心等待，可点击『查看日志』了解进度。");
+                        int currentCount = Volatile.Read(ref downloadStepCount);
+                        if (currentCount != packageCountAtLastPhaseChange)
+                        {
+                            packageCountAtLastPhaseChange = currentCount;
+                            installingStatusShown = false;
+                        }
+
+                        double idleSeconds = GetNpmIdleSeconds();
+                        if (!installingStatusShown && currentCount > 0 && idleSeconds >= 10)
+                        {
+                            installingStatusShown = true;
+                            UpdateStatus("DeepSeek Harness — 已下载 " + currentCount + " 个软件包，正在安装并启动…");
+                            ReportUpdateProgress("正在安装并启动服务…", null);
+                        }
                     }
 
                     Thread.Sleep(500);
@@ -353,12 +401,20 @@ namespace DshTray
             t.Start();
         }
 
-
-        private static string FormatWaitTime(double totalSeconds)
+        private double GetNpmIdleSeconds()
         {
-            int seconds = (int)totalSeconds;
-            if (seconds < 60) return seconds + " 秒";
-            return (seconds / 60) + " 分钟";
+            lock (downloadNoticeLock)
+            {
+                if (lastNpmActivityUtc == DateTime.MinValue) return 0;
+                return Math.Max(0, (DateTime.UtcNow - lastNpmActivityUtc).TotalSeconds);
+            }
+        }
+
+        private void ReportUpdateProgress(string stage, string latestLine)
+        {
+            if (stage != null) updateProgressStage = stage;
+            Action<string, string> cb = UpdateProgressChanged;
+            if (cb != null) cb(updateProgressStage ?? "正在准备更新…", latestLine);
         }
 
         private bool PortIsOpen()
@@ -450,6 +506,15 @@ namespace DshTray
             {
             }
             server = null;
+
+            lock (logLock)
+            {
+                if (logWriter != null)
+                {
+                    logWriter.Dispose();
+                    logWriter = null;
+                }
+            }
         }
     }
 }
