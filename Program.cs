@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
 using System.Net.Sockets;
+using System.Text;
 using System.Threading;
 
 namespace DshTray
@@ -225,6 +226,12 @@ namespace DshTray
             psi.RedirectStandardOutput = true;
             psi.RedirectStandardError = true;
             psi.RedirectStandardInput = true;
+            // dsh (Node) writes UTF-8 to stdout/stderr. This is a WinExe with no
+            // console, so .NET's default Console.OutputEncoding falls back to the
+            // system ANSI code page (GBK on Chinese Windows), which would decode
+            // the UTF-8 bytes as mojibake. Pin UTF-8 explicitly on both streams.
+            psi.StandardOutputEncoding = Encoding.UTF8;
+            psi.StandardErrorEncoding = Encoding.UTF8;
             psi.EnvironmentVariables["npm_config_yes"] = "true";
 
             server = new Process();
@@ -352,12 +359,12 @@ namespace DshTray
                             if (installRequired)
                             {
                                 NotifyUser("dsh 更新完成，服务已启动（下载了 " + downloaded + " 个软件包）。");
-                                ReportUpdateProgress("更新完成，服务已就绪。", null);
+                                ReportUpdateProgress("服务已就绪。", null);
                             }
                             else
                             {
                                 NotifyUser("依赖检查完成，服务已启动。");
-                                ReportUpdateProgress("依赖检查完成，服务已就绪。", null);
+                                ReportUpdateProgress("服务已就绪。", null);
                             }
                             Action completed = UpdateProgressCompleted;
                             if (completed != null) completed();

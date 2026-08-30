@@ -461,7 +461,11 @@ namespace DshTray
 
             EnsureProgressWindow();
             if (progressHwnd == IntPtr.Zero) return;
-            if (started) progressDismissedByUser = false;
+            if (started)
+            {
+                progressDismissedByUser = false;
+                progressIsCompleted = false;
+            }
             if (stage != null) currentProgressStage = stage;
             if (detail != null) currentProgressDetail = TrimProgressDetail(detail);
 
@@ -469,15 +473,24 @@ namespace DshTray
             {
                 progressIsCompleted = true;
                 KillTimer(progressHwnd, (UIntPtr)2);
-                SetTimer(progressHwnd, (UIntPtr)1, 2500, IntPtr.Zero);
+                // Service is ready: show for 1 second, then fall back to the tray.
+                SetTimer(progressHwnd, (UIntPtr)1, 1000, IntPtr.Zero);
             }
-            else if (stage != null && stage.IndexOf("完成", StringComparison.Ordinal) < 0)
+            else if (!progressIsCompleted && stage != null)
             {
-                progressIsCompleted = false;
                 SetTimer(progressHwnd, (UIntPtr)2, 35, IntPtr.Zero);
             }
             InvalidateRect(progressHwnd, IntPtr.Zero, false);
-            if (!progressDismissedByUser) ShowProgressWindow();
+            if (!progressDismissedByUser)
+            {
+                ShowProgressWindow();
+                if (progressIsCompleted)
+                {
+                    // Log lines arriving after startup re-show the window once;
+                    // hide it again after 1 second.
+                    SetTimer(progressHwnd, (UIntPtr)1, 1000, IntPtr.Zero);
+                }
+            }
         }
 
         private static void EnsureProgressWindow()

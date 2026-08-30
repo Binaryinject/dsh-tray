@@ -25,6 +25,7 @@ namespace DshTray
         private static NSTextField progressDetail;
         private static NSProgressIndicator progressBar;
         private static bool progressDismissedByUser;
+        private static bool progressIsCompleted;
 
         public static int Run(Core c)
         {
@@ -77,7 +78,11 @@ namespace DshTray
             };
             c.UpdateProgressStarted = delegate
             {
-                app.BeginInvokeOnMainThread(delegate { progressDismissedByUser = false; });
+                app.BeginInvokeOnMainThread(delegate
+                {
+                    progressDismissedByUser = false;
+                    progressIsCompleted = false;
+                });
             };
             c.UpdateProgressChanged = delegate (string stage, string detail)
             {
@@ -171,7 +176,11 @@ namespace DshTray
             progressMenuItem.Hidden = false;
             if (!string.IsNullOrEmpty(stage)) progressStatus.StringValue = stage;
             if (!string.IsNullOrWhiteSpace(detail)) progressDetail.StringValue = "最新日志：" + TrimProgressDetail(detail);
-            if (!progressDismissedByUser) progressPanel.OrderFrontRegardless();
+            if (!progressDismissedByUser)
+            {
+                progressPanel.OrderFrontRegardless();
+                if (progressIsCompleted) ScheduleAutoHide();
+            }
         }
 
         private static void CompleteProgressWindow()
@@ -182,15 +191,26 @@ namespace DshTray
             progressBar.MinValue = 0;
             progressBar.MaxValue = 100;
             progressBar.DoubleValue = 100;
-            progressStatus.StringValue = "更新完成，服务已就绪。";
-            if (!progressDismissedByUser) progressPanel.OrderFrontRegardless();
+            progressStatus.StringValue = "服务已就绪。";
+            progressIsCompleted = true;
+            if (!progressDismissedByUser)
+            {
+                progressPanel.OrderFrontRegardless();
+                ScheduleAutoHide();
+            }
+        }
 
+        private static void ScheduleAutoHide()
+        {
             ThreadPool.QueueUserWorkItem(delegate
             {
-                Thread.Sleep(2500);
+                Thread.Sleep(1000);
                 NSApplication.SharedApplication.BeginInvokeOnMainThread(delegate
                 {
-                    if (progressPanel != null) progressPanel.OrderOut(null);
+                    if (progressPanel == null) return;
+                    if (progressDismissedByUser) return;
+                    if (!progressIsCompleted) return;
+                    progressPanel.OrderOut(null);
                 });
             });
         }
