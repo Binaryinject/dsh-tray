@@ -2,7 +2,7 @@
 
 DeepSeek Harness 的托盘启动器（原生、无依赖、跨平台）
 
-为 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) 的 Web GUI 提供一个「双击即用、无黑窗口」的桌面入口：后台拉起 `dsh web`，端口就绪后自动打开浏览器，并常驻系统托盘（Windows 托盘 / macOS 菜单栏）。
+为 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) 的 Web GUI 提供一个「双击即用、无黑窗口」的桌面入口：后台拉起 `dsh web`，服务就绪后自动打开前端，并常驻系统托盘（Windows 托盘 / macOS 菜单栏）。
 
 图标使用 DeepSeek Harness 官方鲸鱼标志。
 
@@ -10,11 +10,12 @@ DeepSeek Harness 的托盘启动器（原生、无依赖、跨平台）
 
 - **单文件原生可执行文件**：NativeAOT 编译，零 .NET 运行时依赖
 - **跨平台**：Windows（托盘）+ macOS（菜单栏），纯原生实现，不依赖 WinForms / Electron
-- **自动打开浏览器**：轮询端口，监听就绪后打开 `http://127.0.0.1:3080`
-- **启动状态通知与进度**：检测到依赖检查或更新时自动显示小型进度窗口，按“解析依赖、下载软件包、安装并启动、完成”展示阶段和最新日志；窗口跟随系统深浅主题，可转入后台并从托盘菜单重新打开
+- **Chrome PWA 应用启动（Windows）**：优先通过 Chrome 的 `chrome_proxy.exe` 打开已安装的 DSH PWA 应用，获得接近原生 App 的独立窗口体验；未安装时自动打开可安装页面，并提示在地址栏点击「安装应用」
+- **可靠的就绪检测**：监听 `dsh web: http://…` 输出标记（而非轮询端口），确保 Web 服务器与配置初始化完成后才打开前端
+- **启动状态通知与进度**：检测到依赖检查或更新时自动显示小型进度窗口，按「解析依赖、下载软件包、安装并启动、完成」展示阶段和最新日志；窗口跟随系统深浅主题，可转入后台并从托盘菜单重新打开
 - **托盘状态与完成通知**：下载期间在进度窗口和托盘中显示已完成的软件包数；不弹中间通知，只在服务启动完成后发送一次系统通知
 - **托盘菜单**：打开网页 / 查看日志（最新记录在最前）/ 重启服务器 / 退出并停止服务
-- **单实例**：重复启动不冲突，而是让已运行实例重新打开浏览器
+- **单实例**：重复启动不冲突，而是让已运行实例重新打开前端
 
 ## 编译
 
@@ -27,6 +28,8 @@ dotnet publish -c Release -r win-x64
 ```
 
 产物：`bin\Release\net10.0-windows\win-x64\publish\dsh-tray.exe`
+
+也可以直接双击 `NativeAot.bat` 一键发布（发布完成后停留在窗口，便于查看结果）。
 
 ### macOS
 
@@ -46,7 +49,7 @@ dotnet publish -c Release -r osx-x64     # Intel
 
 | 命令 | 说明 |
 |------|------|
-| `dsh-tray` | 端口 3080，自动打开浏览器 |
+| `dsh-tray` | 端口 3080，自动打开前端 |
 | `dsh-tray --port 8080` | 自定义端口 |
 | `dsh-tray --no-open` | 只起服务，不打开浏览器 |
 | `dsh-tray --stop` | 优雅停止已运行的实例 |
@@ -66,7 +69,7 @@ GitHub Actions 会在推送 `v*` tag 时自动构建并创建 Release（见 `.gi
 
 ## 依赖
 
-运行时依赖 `npx`（Node.js）来解析并运行 `@deepseek-ai/dsh`；首次启动若本地未缓存该包会自动下载，安装确认会自动处理，无需在后台输入 `y`。
+运行时依赖 `npx`（Node.js）来解析并运行 `@deepseek-ai/dsh@next`（next 通道）；首次启动若本地未缓存该包会自动下载，安装确认会自动处理，无需在后台输入 `y`。
 
 ## License
 

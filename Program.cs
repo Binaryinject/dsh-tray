@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
-using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 
@@ -98,6 +97,8 @@ namespace DshTray
         private DateTime lastNpmActivityUtc;
         private string updateProgressStage;
         private int portWatcherGeneration;
+        private volatile bool webReady;
+        private string webLaunchUrl;
 
         /// <summary>Invoked (on the platform UI thread) when a "stop" command is received.</summary>
         public Action OnShutdownRequest;
@@ -147,7 +148,16 @@ namespace DshTray
             try
             {
 #if WINDOWS
-                Process.Start(new ProcessStartInfo(Url) { UseShellExecute = true });
+                // Launch the installed DSH PWA through Chrome's proxy entry
+                // point. The dsh web process itself is started with --no-open.
+                if (!TryOpenChromeApp())
+                {
+                    // Chrome does not expose a reliable unattended PWA
+                    // installer on Windows. Open the installable page once so
+                    // the user can click Chrome's "Install app" button.
+                    Process.Start(new ProcessStartInfo(webLaunchUrl ?? Url) { UseShellExecute = true });
+                    NotifyUser("Chrome DSH App 尚未安装，请在地址栏点击“安装应用”。");
+                }
 #else
                 Process.Start(new ProcessStartInfo("open", Url) { UseShellExecute = false });
 #endif
@@ -156,6 +166,73 @@ namespace DshTray
             {
             }
         }
+
+#if WINDOWS
+        private const string ChromeDshAppId = "hgiemfgfjhalibdoboikeiepnnjapnpc";
+
+        private bool TryOpenChromeApp()
+        {
+            string profile = FindChromeAppProfile(ChromeDshAppId);
+            string proxy = FindChromeProxy();
+            if (profile == null || proxy == null) return false;
+
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo(proxy)
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                psi.ArgumentList.Add("--profile-directory=" + profile);
+                psi.ArgumentList.Add("--app-id=" + ChromeDshAppId);
+                Process.Start(psi);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private string FindChromeProxy()
+        {
+            string[] roots = new string[]
+            {
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+                Environment.GetEnvironmentVariable("ProgramW6432")
+            };
+            for (int i = 0; i < roots.Length; i++)
+            {
+                if (string.IsNullOrEmpty(roots[i])) continue;
+                string path = Path.Combine(roots[i], "Google", "Chrome", "Application", "chrome_proxy.exe");
+                if (File.Exists(path)) return path;
+            }
+            return null;
+        }
+
+        private string FindChromeAppProfile(string appId)
+        {
+            string userData = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Google", "Chrome", "User Data");
+            if (!Directory.Exists(userData)) return null;
+
+            string appFolder = "_crx_" + appId;
+            string[] profiles = Directory.GetDirectories(userData, "*", SearchOption.TopDirectoryOnly);
+            for (int i = 0; i < profiles.Length; i++)
+            {
+                string profileName = Path.GetFileName(profiles[i]);
+                if (!string.Equals(profileName, "Default", StringComparison.OrdinalIgnoreCase)
+                    && !profileName.StartsWith("Profile ", StringComparison.OrdinalIgnoreCase)) continue;
+                string installed = Path.Combine(profiles[i], "Web Applications", appFolder);
+                if (Directory.Exists(installed)) return profileName;
+            }
+            return null;
+        }
+
+#endif
 
         public void OpenLog()
         {
@@ -209,6 +286,8 @@ namespace DshTray
             downloadStepCount = 0;
             lastNpmActivityUtc = DateTime.MinValue;
             updateProgressStage = null;
+            webReady = false;
+            webLaunchUrl = null;
             UpdateStatus("DeepSeek Harness — 服务正在启动…");
 
             ProcessStartInfo psi = new ProcessStartInfo();
@@ -216,10 +295,10 @@ namespace DshTray
             psi.FileName = "cmd.exe";
             // --loglevel http makes npm emit fetch/cache-miss lines even when
             // stderr is redirected, so the tray can report downloads.
-            psi.Arguments = "/c npx --yes --loglevel http @deepseek-ai/dsh web --port " + port;
+            psi.Arguments = "/c npx --yes --loglevel http @deepseek-ai/dsh@next web --port " + port + " --no-open";
 #else
             psi.FileName = "/bin/sh";
-            psi.Arguments = "-c \"npx --yes --loglevel http @deepseek-ai/dsh web --port " + port + "\"";
+            psi.Arguments = "-c \"npx --yes --loglevel http @deepseek-ai/dsh@next web --port " + port + " --no-open\"";
 #endif
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;
@@ -264,6 +343,15 @@ namespace DshTray
             if (line == null) return;
 
             CheckServerOutput(line);
+            int webMarker = line.IndexOf("dsh web:", StringComparison.OrdinalIgnoreCase);
+            if (webMarker >= 0)
+            {
+                string announcedUrl = line.Substring(webMarker + "dsh web:".Length).Trim();
+                if (announcedUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+                    || announcedUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                    webLaunchUrl = announcedUrl;
+                webReady = true;
+            }
             TrackDownloadProgress(line);
             if (downloadInstallNoticeShown) ReportUpdateProgress(null, line);
             if (logWriter == null) return;
@@ -350,7 +438,9 @@ namespace DshTray
                 while (true)
                 {
                     if (shuttingDown || generation != portWatcherGeneration) return;
-                    if (PortIsOpen())
+                    // dsh emits this only after the web server and its profile
+                    // have finished initializing: dsh web: http://...
+                    if (webReady)
                     {
                         if (shuttingDown || generation != portWatcherGeneration) return;
                         if (downloadInstallNoticeShown)
@@ -422,29 +512,6 @@ namespace DshTray
             if (stage != null) updateProgressStage = stage;
             Action<string, string> cb = UpdateProgressChanged;
             if (cb != null) cb(updateProgressStage ?? "正在准备更新…", latestLine);
-        }
-
-        private bool PortIsOpen()
-        {
-            TcpClient client = new TcpClient();
-            try
-            {
-                IAsyncResult r = client.BeginConnect("127.0.0.1", port, null, null);
-                if (r.AsyncWaitHandle.WaitOne(500))
-                {
-                    client.EndConnect(r);
-                    return true;
-                }
-                return false;
-            }
-            catch
-            {
-                return false;
-            }
-            finally
-            {
-                client.Close();
-            }
         }
 
         private void StartCommandListener()
