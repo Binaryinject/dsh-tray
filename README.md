@@ -14,7 +14,8 @@ DeepSeek Harness 的托盘启动器（原生、无依赖、跨平台）
 - **可靠的就绪检测**：监听 `dsh web: http://…` 输出标记（而非轮询端口），确保 Web 服务器与配置初始化完成后才打开前端
 - **启动状态通知与进度**：检测到依赖检查或更新时自动显示小型进度窗口，按「解析依赖、下载软件包、安装并启动、完成」展示阶段和最新日志；窗口跟随系统深浅主题，可转入后台并从托盘菜单重新打开
 - **托盘状态与完成通知**：下载期间在进度窗口和托盘中显示已完成的软件包数；不弹中间通知，只在服务启动完成后发送一次系统通知
-- **托盘菜单**：打开网页 / 查看日志（最新记录在最前）/ 重启服务器 / 退出并停止服务
+- **托盘菜单**：显示当前版本号 / 打开网页 / 查看日志（最新记录在最前）/ 重启服务器 / 退出并停止服务
+- **自动更新**：每次启动后台检测 GitHub Release 最新稳定版；发现新版时弹窗询问，确认后下载并实时显示进度，随后静默安装并自动重启到新版本
 - **单实例**：重复启动不冲突，而是让已运行实例重新打开前端
 
 ## 编译
@@ -66,6 +67,17 @@ GitHub Actions 会在推送 `v*` tag 时自动构建并创建 Release（见 `.gi
 | macOS Apple Silicon | `dsh-tray-osx-arm64.dmg` |
 
 > macOS 目前只构建 Apple Silicon（arm64）。Intel 版因 GitHub 已无配得上 .NET 10 的 Intel runner（Xcode 版本过旧），暂不提供。
+
+## 自动更新
+
+启动后会在后台查询 `api.github.com/repos/Binaryinject/dsh-tray/releases/latest`，与当前版本比较；发现新版本时弹窗询问，确认后下载对应平台的安装包并显示下载进度，完成后静默安装并重启：
+
+| 平台 | 更新方式 |
+|------|---------|
+| Windows | 下载 `dsh-tray-setup-win-x64.exe`，以 `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART` 静默安装，随后重新启动（无需 UAC）|
+| macOS | 下载 `dsh-tray-osx-arm64.dmg`，挂载后以 `ditto` 覆盖 `/Applications/dsh-tray.app` 并重新启动（若对 `/Applications` 无写权限需输入密码授权）|
+
+> 检测与下载失败均为静默处理（仅在开始更新后失败时弹通知），不影响正常启动。检测的是 `latest` 稳定版，不含 prerelease。
 
 ## 依赖
 

@@ -49,9 +49,11 @@ namespace DshTray
             actions = new MenuActions(core);
             NSMenu menu = new NSMenu();
             statusMenuItem = new NSMenuItem { Title = "状态：正在启动…", Enabled = false };
+            NSMenuItem versionMenuItem = new NSMenuItem { Title = "版本 " + SelfUpdater.GetCurrentVersion(), Enabled = false };
             progressMenuItem = MakeItem("显示更新进度", "showProgress:", actions);
             progressMenuItem.Hidden = true;
             menu.AddItem(statusMenuItem);
+            menu.AddItem(versionMenuItem);
             menu.AddItem(progressMenuItem);
             menu.AddItem(NSMenuItem.SeparatorItem);
             menu.AddItem(MakeItem("打开网页", "openBrowser:", actions));
@@ -92,6 +94,22 @@ namespace DshTray
             {
                 app.BeginInvokeOnMainThread(CompleteProgressWindow);
             };
+            c.SelfUpdateAvailable = delegate (string tag, string downloadUrl, string releaseUrl)
+            {
+                app.BeginInvokeOnMainThread(delegate { PromptUpdate(tag, downloadUrl); });
+            };
+            c.SelfUpdateProgress = delegate (long received, long total)
+            {
+                app.BeginInvokeOnMainThread(delegate { UpdateSelfUpdateProgress(received, total); });
+            };
+            c.SelfUpdateDownloaded = delegate (string installerPath)
+            {
+                app.BeginInvokeOnMainThread(delegate { ApplyMacUpdate(installerPath); });
+            };
+            c.SelfUpdateFailed = delegate (string reason)
+            {
+                app.BeginInvokeOnMainThread(delegate { ShowNotification("DeepSeek Harness", "自动更新失败：" + reason); });
+            };
 
             c.Start();
 
@@ -111,6 +129,96 @@ namespace DshTray
         {
             core.Shutdown();
             NSApplication.SharedApplication.Terminate(null);
+        }
+
+        private static void PromptUpdate(string tag, string downloadUrl)
+        {
+            NSAlert alert = new NSAlert();
+            alert.MessageText = "发现新版本";
+            alert.InformativeText = "发现新版本 " + tag + "（当前 " + SelfUpdater.GetCurrentVersion() + "）。\n是否下载并自动更新？";
+            alert.AddButton("更新");
+            alert.AddButton("取消");
+            long result = (long)alert.RunModal();
+            if (result == 1000) // NSAlertFirstButtonReturn
+            {
+                EnsureProgressWindow();
+                progressMenuItem.Hidden = false;
+                progressIsCompleted = false;
+                progressDismissedByUser = false;
+                progressBar.StopAnimation(null);
+                progressBar.Indeterminate = true;
+                progressBar.StartAnimation(null);
+                progressStatus.StringValue = "正在下载更新…";
+                progressDetail.StringValue = "准备下载…";
+                progressPanel.OrderFrontRegardless();
+                core.BeginSelfUpdateDownload(downloadUrl);
+            }
+        }
+
+        private static void UpdateSelfUpdateProgress(long received, long total)
+        {
+            EnsureProgressWindow();
+            progressMenuItem.Hidden = false;
+            progressIsCompleted = false;
+            progressDismissedByUser = false;
+            int percent = total > 0 ? (int)(received * 100 / total) : -1;
+            progressBar.StopAnimation(null);
+            if (percent >= 0)
+            {
+                progressBar.Indeterminate = false;
+                progressBar.MinValue = 0;
+                progressBar.MaxValue = 100;
+                progressBar.DoubleValue = percent;
+            }
+            else
+            {
+                progressBar.Indeterminate = true;
+                progressBar.StartAnimation(null);
+            }
+            progressStatus.StringValue = "正在下载更新…";
+            progressDetail.StringValue = "下载进度：" + SelfUpdater.FormatBytes(received)
+                + (total > 0 ? " / " + SelfUpdater.FormatBytes(total) : "");
+            if (!progressDismissedByUser) progressPanel.OrderFrontRegardless();
+        }
+
+        private static void ApplyMacUpdate(string dmgPath)
+        {
+            EnsureProgressWindow();
+            progressStatus.StringValue = "已下载，正在安装并重启…";
+            progressDetail.StringValue = "即将静默安装并重新启动。";
+            progressBar.StopAnimation(null);
+            progressBar.Indeterminate = false;
+            progressBar.MinValue = 0;
+            progressBar.MaxValue = 100;
+            progressBar.DoubleValue = 100;
+
+            try
+            {
+                string dir = Path.GetDirectoryName(dmgPath);
+                string mountPoint = Path.Combine(dir, "mnt");
+                string scriptPath = Path.Combine(dir, "apply-update.sh");
+                string script =
+                    "#!/bin/bash\n" +
+                    "while pgrep -x dsh-tray >/dev/null 2>&1; do sleep 0.5; done\n" +
+                    "hdiutil attach \"" + dmgPath + "\" -nobrowse -mountpoint \"" + mountPoint + "\"\n" +
+                    "rm -rf /Applications/dsh-tray.app\n" +
+                    "ditto \"" + mountPoint + "/dsh-tray.app\" /Applications/dsh-tray.app\n" +
+                    "hdiutil detach \"" + mountPoint + "\"\n" +
+                    "open /Applications/dsh-tray.app\n";
+                File.WriteAllText(scriptPath, script);
+
+                ProcessStartInfo psi = new ProcessStartInfo();
+                psi.FileName = "/bin/bash";
+                psi.UseShellExecute = false;
+                psi.ArgumentList.Add(scriptPath);
+                Process p = Process.Start(psi);
+                if (p != null) p.Dispose();
+            }
+            catch
+            {
+            }
+
+            Shutdown();
         }
 
         private static void EnsureProgressWindow()

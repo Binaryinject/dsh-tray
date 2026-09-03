@@ -1,9 +1,11 @@
 #if WINDOWS
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text;
 using Microsoft.Win32;
 
 namespace DshTray
@@ -30,6 +32,10 @@ namespace DshTray
         private const uint WM_APP_NOTIFY = 0x8002;
         private const uint WM_APP_STATUS = 0x8003;
         private const uint WM_APP_PROGRESS = 0x8004;
+        private const uint WM_APP_UPDATE_AVAILABLE = 0x8005;
+        private const uint WM_APP_UPDATE_PROGRESS = 0x8006;
+        private const uint WM_APP_UPDATE_DONE = 0x8007;
+        private const uint WM_APP_UPDATE_FAILED = 0x8008;
 
         private const int ID_OPEN = 1001;
         private const int ID_LOG = 1002;
@@ -108,6 +114,14 @@ namespace DshTray
         private static bool hasUpdateProgress;
         private static bool progressDismissedByUser;
         private static readonly Queue<Tuple<string, string>> pendingNotifications = new Queue<Tuple<string, string>>();
+        private static readonly object updateLock = new object();
+        private static string pendingUpdateTag;
+        private static string pendingUpdateDownloadUrl;
+        private static long pendingUpdateReceived;
+        private static long pendingUpdateTotal;
+        private static string pendingUpdateInstallerPath;
+        private static string pendingUpdateError;
+        private static int currentProgressPercent = -1;
 
         public static int Run(Core c)
         {
@@ -120,6 +134,10 @@ namespace DshTray
             c.UpdateProgressStarted = QueueProgressStarted;
             c.UpdateProgressChanged = QueueProgress;
             c.UpdateProgressCompleted = QueueProgressCompleted;
+            c.SelfUpdateAvailable = QueueUpdateAvailable;
+            c.SelfUpdateProgress = QueueUpdateProgress;
+            c.SelfUpdateDownloaded = QueueUpdateDownloaded;
+            c.SelfUpdateFailed = QueueUpdateFailed;
 
             c.Start();
 
@@ -219,6 +237,30 @@ namespace DshTray
             if (msg == WM_APP_PROGRESS)
             {
                 DrainProgress();
+                return IntPtr.Zero;
+            }
+
+            if (msg == WM_APP_UPDATE_AVAILABLE)
+            {
+                DrainUpdateAvailable();
+                return IntPtr.Zero;
+            }
+
+            if (msg == WM_APP_UPDATE_PROGRESS)
+            {
+                DrainUpdateProgress();
+                return IntPtr.Zero;
+            }
+
+            if (msg == WM_APP_UPDATE_DONE)
+            {
+                DrainUpdateDownloaded();
+                return IntPtr.Zero;
+            }
+
+            if (msg == WM_APP_UPDATE_FAILED)
+            {
+                DrainUpdateFailed();
                 return IntPtr.Zero;
             }
 
@@ -343,6 +385,7 @@ namespace DshTray
         {
             IntPtr menu = CreatePopupMenu();
             AppendMenu(menu, MF_STRING | MF_GRAYED, 0, currentStatus);
+            AppendMenu(menu, MF_STRING | MF_GRAYED, 0, "版本 " + SelfUpdater.GetCurrentVersion());
             if (hasUpdateProgress) AppendMenu(menu, MF_STRING, (uint)ID_PROGRESS, "显示更新进度");
             AppendMenu(menu, MF_SEPARATOR, 0, null);
             AppendMenu(menu, MF_STRING, (uint)ID_OPEN, "打开网页");
@@ -443,6 +486,168 @@ namespace DshTray
             if (hwnd != IntPtr.Zero) PostMessage(hwnd, WM_APP_PROGRESS, IntPtr.Zero, IntPtr.Zero);
         }
 
+        private static void QueueUpdateAvailable(string tag, string downloadUrl, string releaseUrl)
+        {
+            lock (updateLock)
+            {
+                pendingUpdateTag = tag;
+                pendingUpdateDownloadUrl = downloadUrl;
+            }
+            if (hwnd != IntPtr.Zero) PostMessage(hwnd, WM_APP_UPDATE_AVAILABLE, IntPtr.Zero, IntPtr.Zero);
+        }
+
+        private static void DrainUpdateAvailable()
+        {
+            string tag, downloadUrl;
+            lock (updateLock)
+            {
+                tag = pendingUpdateTag;
+                downloadUrl = pendingUpdateDownloadUrl;
+            }
+            if (string.IsNullOrEmpty(downloadUrl)) return;
+
+            int result = MessageBox(hwnd,
+                "发现新版本 " + tag + "（当前 " + SelfUpdater.GetCurrentVersion() + "）。\n是否下载并自动更新？",
+                "DeepSeek Harness 更新",
+                0x00000004 /* MB_YESNO */ | 0x00000020 /* MB_ICONQUESTION */);
+            if (result == 6 /* IDYES */)
+            {
+                SetUpdateProgressUI(0, "准备下载…");
+                core.BeginSelfUpdateDownload(downloadUrl);
+            }
+        }
+
+        private static void QueueUpdateProgress(long received, long total)
+        {
+            lock (updateLock)
+            {
+                pendingUpdateReceived = received;
+                pendingUpdateTotal = total;
+            }
+            if (hwnd != IntPtr.Zero) PostMessage(hwnd, WM_APP_UPDATE_PROGRESS, IntPtr.Zero, IntPtr.Zero);
+        }
+
+        private static void DrainUpdateProgress()
+        {
+            long received, total;
+            lock (updateLock)
+            {
+                received = pendingUpdateReceived;
+                total = pendingUpdateTotal;
+            }
+            int percent = total > 0 ? (int)(received * 100 / total) : -1;
+            string detail = total > 0
+                ? SelfUpdater.FormatBytes(received) + " / " + SelfUpdater.FormatBytes(total)
+                : SelfUpdater.FormatBytes(received);
+            SetUpdateProgressUI(percent, detail);
+        }
+
+        private static void SetUpdateProgressUI(int percent, string detail)
+        {
+            EnsureProgressWindow();
+            if (progressHwnd == IntPtr.Zero) return;
+            currentProgressStage = "正在下载更新…";
+            currentProgressDetail = detail;
+            currentProgressPercent = percent;
+            progressDismissedByUser = false;
+            progressIsCompleted = false;
+            InvalidateRect(progressHwnd, IntPtr.Zero, false);
+            ShowProgressWindow();
+        }
+
+        private static void QueueUpdateDownloaded(string installerPath)
+        {
+            lock (updateLock)
+            {
+                pendingUpdateInstallerPath = installerPath;
+            }
+            if (hwnd != IntPtr.Zero) PostMessage(hwnd, WM_APP_UPDATE_DONE, IntPtr.Zero, IntPtr.Zero);
+        }
+
+        private static void DrainUpdateDownloaded()
+        {
+            string installerPath;
+            lock (updateLock)
+            {
+                installerPath = pendingUpdateInstallerPath;
+            }
+            if (string.IsNullOrEmpty(installerPath)) return;
+
+            if (progressHwnd != IntPtr.Zero)
+            {
+                currentProgressStage = "已下载，正在安装并重启…";
+                currentProgressDetail = "即将静默安装并重新启动。";
+                currentProgressPercent = 100;
+                progressIsCompleted = false;
+                InvalidateRect(progressHwnd, IntPtr.Zero, false);
+                ShowProgressWindow();
+            }
+
+            LaunchWindowsInstaller(installerPath);
+            Shutdown();
+        }
+
+        private static void QueueUpdateFailed(string reason)
+        {
+            lock (updateLock)
+            {
+                pendingUpdateError = reason;
+            }
+            if (hwnd != IntPtr.Zero) PostMessage(hwnd, WM_APP_UPDATE_FAILED, IntPtr.Zero, IntPtr.Zero);
+        }
+
+        private static void DrainUpdateFailed()
+        {
+            string reason;
+            lock (updateLock)
+            {
+                reason = pendingUpdateError;
+            }
+            if (progressHwnd != IntPtr.Zero)
+            {
+                currentProgressStage = "更新失败";
+                currentProgressDetail = string.IsNullOrEmpty(reason) ? "未知错误" : reason;
+                currentProgressPercent = -1;
+                progressIsCompleted = false;
+                InvalidateRect(progressHwnd, IntPtr.Zero, false);
+            }
+            QueueNotification("DeepSeek Harness", "自动更新失败：" + (string.IsNullOrEmpty(reason) ? "未知错误" : reason));
+        }
+
+        private static void LaunchWindowsInstaller(string installerPath)
+        {
+            try
+            {
+                string installDir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "Programs", "DeepSeek Harness Tray");
+                string targetExe = Path.Combine(installDir, "dsh-tray.exe");
+                string batPath = Path.Combine(Path.GetDirectoryName(installerPath), "apply-update.cmd");
+
+                string bat =
+                    "@echo off\r\n" +
+                    ":wait\r\n" +
+                    "tasklist /fi \"IMAGENAME eq dsh-tray.exe\" 2>nul | findstr /i /c:\"dsh-tray.exe\" >nul\r\n" +
+                    "if %errorlevel%==0 (\r\n" +
+                    "  timeout /t 1 /nobreak >nul\r\n" +
+                    "  goto wait\r\n" +
+                    ")\r\n" +
+                    "\"" + installerPath + "\" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART\r\n" +
+                    "start \"\" \"" + targetExe + "\"\r\n" +
+                    "del \"%~f0\"\r\n";
+                File.WriteAllText(batPath, bat, Encoding.ASCII);
+
+                Process.Start(new ProcessStartInfo("cmd.exe", "/c \"" + batPath + "\"")
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                });
+            }
+            catch
+            {
+            }
+        }
+
         private static void DrainProgress()
         {
             string stage;
@@ -465,6 +670,7 @@ namespace DshTray
             {
                 progressDismissedByUser = false;
                 progressIsCompleted = false;
+                currentProgressPercent = -1;
             }
             if (stage != null) currentProgressStage = stage;
             if (detail != null) currentProgressDetail = TrimProgressDetail(detail);
@@ -553,7 +759,17 @@ namespace DshTray
 
             RECT track = new RECT(24, 68, client.Right - 24, 74);
             FillRounded(buffer, track, 6, trackColor);
-            if (progressIsCompleted)
+            if (currentProgressPercent >= 0)
+            {
+                int trackWidth = track.Right - track.Left;
+                int filledWidth = (int)((long)trackWidth * currentProgressPercent / 100);
+                if (filledWidth > 0)
+                {
+                    RECT filled = new RECT(track.Left, track.Top, track.Left + filledWidth, track.Bottom);
+                    FillRounded(buffer, filled, 6, accent);
+                }
+            }
+            else if (progressIsCompleted)
             {
                 FillRounded(buffer, track, 6, accent);
             }
@@ -568,7 +784,7 @@ namespace DshTray
             }
 
             RECT logTitle = new RECT(24, 92, client.Right - 24, 114);
-            DrawLabel(buffer, "最新日志", logTitle, bodyFont, secondary,
+            DrawLabel(buffer, currentProgressPercent >= 0 ? "下载进度" : "最新日志", logTitle, bodyFont, secondary,
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             RECT logRect = new RECT(24, 116, client.Right - 24, client.Bottom - 70);
             DrawLabel(buffer, currentProgressDetail, logRect, logFont, logText,
@@ -1052,6 +1268,9 @@ namespace DshTray
 
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
         private static extern bool Shell_NotifyIcon(uint dwMessage, ref NOTIFYICONDATA lpData);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int MessageBox(IntPtr hWnd, string text, string caption, uint type);
     }
 }
 #endif

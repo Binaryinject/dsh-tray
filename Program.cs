@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
+using System.Net.Http;
+using System.Reflection;
 using System.Text;
 using System.Threading;
 
@@ -79,6 +81,169 @@ namespace DshTray
         }
     }
 
+    /// <summary>
+    /// Self-update: query the latest GitHub release, compare versions, and download
+    /// the platform installer. The platform layer owns the UI (prompt/progress) and
+    /// the actual silent install + relaunch.
+    /// </summary>
+    internal static class SelfUpdater
+    {
+        private const string RepoOwner = "Binaryinject";
+        private const string RepoName = "dsh-tray";
+        private const string ApiUrl = "https://api.github.com/repos/" + RepoOwner + "/" + RepoName + "/releases/latest";
+
+        internal sealed class ReleaseInfo
+        {
+            public string Tag;
+            public Version Version;
+            public string DownloadUrl;
+            public string HtmlUrl;
+        }
+
+        /// <summary>Installer asset name for the current platform.</summary>
+        internal static string GetInstallerFileName()
+        {
+#if WINDOWS
+            return "dsh-tray-setup-win-x64.exe";
+#else
+            return "dsh-tray-osx-arm64.dmg";
+#endif
+        }
+
+        /// <summary>Current app version, read from the assembly informational version.</summary>
+        internal static string GetCurrentVersion()
+        {
+            try
+            {
+                var attr = typeof(SelfUpdater).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>();
+                string v = attr != null ? attr.InformationalVersion : null;
+                if (!string.IsNullOrEmpty(v))
+                {
+                    int plus = v.IndexOf('+');
+                    if (plus >= 0) v = v.Substring(0, plus);
+                    if (TryParseVersion(v) != null) return v;
+                }
+            }
+            catch
+            {
+            }
+            try
+            {
+                Version av = typeof(SelfUpdater).Assembly.GetName().Version;
+                if (av != null) return av.Major + "." + av.Minor + "." + av.Build;
+            }
+            catch
+            {
+            }
+            return "0.0.0";
+        }
+
+        internal static Version TryParseVersion(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return null;
+            string v = value.Trim();
+            if (v.Length > 0 && (v[0] == 'v' || v[0] == 'V')) v = v.Substring(1);
+            Version parsed;
+            if (Version.TryParse(v, out parsed)) return parsed;
+            return null;
+        }
+
+        internal static string FormatBytes(long bytes)
+        {
+            if (bytes < 1024) return bytes + " B";
+            double kb = bytes / 1024.0;
+            if (kb < 1024) return kb.ToString("0.0") + " KB";
+            double mb = kb / 1024.0;
+            if (mb < 1024) return mb.ToString("0.0") + " MB";
+            return (mb / 1024.0).ToString("0.0") + " GB";
+        }
+
+        /// <summary>Query the latest stable release. Returns null on error or no usable asset.</summary>
+        internal static ReleaseInfo CheckLatest()
+        {
+            using (HttpClient client = new HttpClient())
+            {
+                client.Timeout = TimeSpan.FromSeconds(30);
+                client.DefaultRequestHeaders.UserAgent.ParseAdd("dsh-tray");
+                client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
+                using (HttpResponseMessage resp = client.GetAsync(ApiUrl).GetAwaiter().GetResult())
+                {
+                    resp.EnsureSuccessStatusCode();
+                    string json = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                    return ParseRelease(json);
+                }
+            }
+        }
+
+        /// <summary>Download a file, reporting (received, total) progress (-1 total when unknown).</summary>
+        internal static void DownloadFile(string url, string destPath, Action<long, long> progress)
+        {
+            using (HttpClient client = new HttpClient())
+            {
+                client.Timeout = TimeSpan.FromMinutes(30);
+                client.DefaultRequestHeaders.UserAgent.ParseAdd("dsh-tray");
+                using (HttpResponseMessage resp = client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead).GetAwaiter().GetResult())
+                {
+                    resp.EnsureSuccessStatusCode();
+                    long total = resp.Content.Headers.ContentLength.HasValue ? resp.Content.Headers.ContentLength.Value : -1;
+                    using (Stream stream = resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult())
+                    using (FileStream file = new FileStream(destPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                    {
+                        byte[] buffer = new byte[81920];
+                        long received = 0;
+                        int n;
+                        while ((n = stream.Read(buffer, 0, buffer.Length)) > 0)
+                        {
+                            file.Write(buffer, 0, n);
+                            received += n;
+                            if (progress != null) progress(received, total);
+                        }
+                    }
+                }
+            }
+        }
+
+        private static ReleaseInfo ParseRelease(string json)
+        {
+            if (string.IsNullOrEmpty(json)) return null;
+            ReleaseInfo info = new ReleaseInfo();
+            info.Tag = ExtractStringField(json, "tag_name");
+            info.HtmlUrl = ExtractStringField(json, "html_url");
+            info.DownloadUrl = ExtractAssetUrl(json, GetInstallerFileName());
+            info.Version = TryParseVersion(info.Tag);
+            if (info.DownloadUrl == null || info.Version == null) return null;
+            return info;
+        }
+
+        private static string ExtractStringField(string json, string field)
+        {
+            int keyIdx = json.IndexOf("\"" + field + "\"", StringComparison.Ordinal);
+            if (keyIdx < 0) return null;
+            int colon = json.IndexOf(':', keyIdx);
+            if (colon < 0) return null;
+            int valueQuote = json.IndexOf('"', colon + 1);
+            if (valueQuote < 0) return null;
+            int endQuote = json.IndexOf('"', valueQuote + 1);
+            if (endQuote < 0) return null;
+            return json.Substring(valueQuote + 1, endQuote - valueQuote - 1);
+        }
+
+        private static string ExtractAssetUrl(string json, string assetName)
+        {
+            int nameIdx = json.IndexOf("\"" + assetName + "\"", StringComparison.Ordinal);
+            if (nameIdx < 0) return null;
+            int urlKey = json.IndexOf("browser_download_url", nameIdx, StringComparison.Ordinal);
+            if (urlKey < 0) return null;
+            int colon = json.IndexOf(':', urlKey);
+            if (colon < 0) return null;
+            int valueQuote = json.IndexOf('"', colon + 1);
+            if (valueQuote < 0) return null;
+            int endQuote = json.IndexOf('"', valueQuote + 1);
+            if (endQuote < 0) return null;
+            return json.Substring(valueQuote + 1, endQuote - valueQuote - 1);
+        }
+    }
+
     /// <summary>Shared, platform-independent launcher logic.</summary>
     internal sealed class Core
     {
@@ -99,6 +264,18 @@ namespace DshTray
         private int portWatcherGeneration;
         private volatile bool webReady;
         private string webLaunchUrl;
+
+        /// <summary>Invoked (on a background thread) when a newer release is available: (latestTag, downloadUrl, releaseUrl).</summary>
+        public Action<string, string, string> SelfUpdateAvailable;
+
+        /// <summary>Invoked (on a background thread) with download progress: (received, total).</summary>
+        public Action<long, long> SelfUpdateProgress;
+
+        /// <summary>Invoked (on a background thread) after the installer finished downloading: (installerPath).</summary>
+        public Action<string> SelfUpdateDownloaded;
+
+        /// <summary>Invoked (on a background thread) when the update check/download fails: (reason).</summary>
+        public Action<string> SelfUpdateFailed;
 
         /// <summary>Invoked (on the platform UI thread) when a "stop" command is received.</summary>
         public Action OnShutdownRequest;
@@ -134,6 +311,57 @@ namespace DshTray
             StartServer();
             StartPortWatcher();
             StartCommandListener();
+            StartSelfUpdateCheck();
+        }
+
+        /// <summary>Kick off a background check for a newer GitHub release.</summary>
+        private void StartSelfUpdateCheck()
+        {
+            Thread t = new Thread(delegate ()
+            {
+                try
+                {
+                    SelfUpdater.ReleaseInfo info = SelfUpdater.CheckLatest();
+                    if (info == null || info.Version == null) return;
+                    Version current = SelfUpdater.TryParseVersion(SelfUpdater.GetCurrentVersion());
+                    if (current == null || info.Version <= current) return;
+                    Action<string, string, string> cb = SelfUpdateAvailable;
+                    if (cb != null) cb(info.Tag, info.DownloadUrl, info.HtmlUrl);
+                }
+                catch
+                {
+                }
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        /// <summary>Download the update installer (called by the platform layer after the user accepts).</summary>
+        public void BeginSelfUpdateDownload(string downloadUrl)
+        {
+            Thread t = new Thread(delegate ()
+            {
+                try
+                {
+                    string dir = Path.Combine(Path.GetTempPath(), "dsh-tray-update");
+                    Directory.CreateDirectory(dir);
+                    string dest = Path.Combine(dir, SelfUpdater.GetInstallerFileName());
+                    SelfUpdater.DownloadFile(downloadUrl, dest, delegate (long received, long total)
+                    {
+                        Action<long, long> cb = SelfUpdateProgress;
+                        if (cb != null) cb(received, total);
+                    });
+                    Action<string> done = SelfUpdateDownloaded;
+                    if (done != null) done(dest);
+                }
+                catch (Exception ex)
+                {
+                    Action<string> fail = SelfUpdateFailed;
+                    if (fail != null) fail(ex.Message);
+                }
+            });
+            t.IsBackground = true;
+            t.Start();
         }
 
         public void Shutdown()
