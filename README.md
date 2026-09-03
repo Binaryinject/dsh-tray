@@ -1,87 +1,94 @@
 # dsh-tray
 
-DeepSeek Harness 的托盘启动器（原生、无依赖、跨平台）
+DeepSeek Harness 的原生托盘启动器。它负责启动 DSH Web 服务、等待 DSH 官方就绪信号，并在 Windows 上优先打开 Chrome PWA 应用窗口。
 
-为 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) 的 Web GUI 提供一个「双击即用、无黑窗口」的桌面入口：后台拉起 `dsh web`，服务就绪后自动打开前端，并常驻系统托盘（Windows 托盘 / macOS 菜单栏）。
+## 工作方式
 
-图标使用 DeepSeek Harness 官方鲸鱼标志。
+- 后台运行 `npx --yes --loglevel http @deepseek-ai/dsh@next web --port <port> --no-open`
+- 监听 DSH 输出的 `dsh web: http://...`，确认 Web 服务初始化完成后才打开界面
+- Windows 优先使用 Chrome 的 `chrome_proxy.exe --app-id=...` 启动已安装的 DSH PWA
+- 如果 Chrome PWA 尚未安装，则打开带 token 的 DSH 页面，并提示手动点击地址栏的“安装应用”
+- DSH 本身不会自动打开普通浏览器页面，避免网页和 App 同时启动
+- 启动前会清理占用目标端口的旧服务，确保只运行当前托盘管理的实例
 
-## 特性
+## 功能
 
-- **单文件原生可执行文件**：NativeAOT 编译，零 .NET 运行时依赖
-- **跨平台**：Windows（托盘）+ macOS（菜单栏），纯原生实现，不依赖 WinForms / Electron
-- **Chrome PWA 应用启动（Windows）**：优先通过 Chrome 的 `chrome_proxy.exe` 打开已安装的 DSH PWA 应用，获得接近原生 App 的独立窗口体验；未安装时自动打开可安装页面，并提示在地址栏点击「安装应用」
-- **可靠的就绪检测**：监听 `dsh web: http://…` 输出标记（而非轮询端口），确保 Web 服务器与配置初始化完成后才打开前端
-- **启动状态通知与进度**：检测到依赖检查或更新时自动显示小型进度窗口，按「解析依赖、下载软件包、安装并启动、完成」展示阶段和最新日志；窗口跟随系统深浅主题，可转入后台并从托盘菜单重新打开
-- **托盘状态与完成通知**：下载期间在进度窗口和托盘中显示已完成的软件包数；不弹中间通知，只在服务启动完成后发送一次系统通知
-- **托盘菜单**：显示当前版本号 / 打开网页 / 查看日志（最新记录在最前）/ 重启服务器 / 退出并停止服务
-- **自动更新**：每次启动后台检测 GitHub Release 最新稳定版；发现新版时弹窗询问，确认后下载并实时显示进度，随后静默安装并自动重启到新版本
-- **单实例**：重复启动不冲突，而是让已运行实例重新打开前端
+- Windows 系统托盘 / macOS 菜单栏
+- 启动、下载、安装和退出状态通知
+- 托盘菜单：打开界面、查看日志、重启服务、退出
+- 单实例和命名管道控制
+- NativeAOT 单文件发布，不需要安装 .NET Runtime
+- 每次启动跟随 npm `next` 通道获取 DSH 版本
 
 ## 编译
 
 ### Windows
 
-前置要求：.NET 10 SDK + MSVC C++ 工具链（Visual Studio Build Tools 的「使用 C++ 的桌面开发」工作负载）。
+要求：.NET 10 SDK，以及带 MSVC C++ 工具链的 Visual Studio Build Tools。
 
 ```powershell
 dotnet publish -c Release -r win-x64
 ```
 
-产物：`bin\Release\net10.0-windows\win-x64\publish\dsh-tray.exe`
+产物：`bin\\Release\\net10.0-windows\\win-x64\\publish\\dsh-tray.exe`
 
-也可以直接双击 `NativeAot.bat` 一键发布（发布完成后停留在窗口，便于查看结果）。
+也可以运行仓库中的 `NativeAot.bat`。
 
 ### macOS
 
-前置要求：.NET 10 SDK + Xcode 命令行工具。
+要求：.NET 10 SDK 和 Xcode Command Line Tools。
 
 ```bash
 dotnet workload install macos
-dotnet publish -c Release -r osx-arm64   # Apple Silicon
-dotnet publish -c Release -r osx-x64     # Intel
+dotnet publish -c Release -r osx-arm64
 ```
 
-产物：`bin\Release\net10.0-macos\<rid>\publish\dsh-tray`
-
-> `PublishAot` 已在 csproj 中开启，直接 `publish` 即得到自包含原生可执行文件。
+产物：`bin/Release/net10.0-macos/osx-arm64/publish/dsh-tray`
 
 ## 使用
 
-| 命令 | 说明 |
-|------|------|
-| `dsh-tray` | 端口 3080，自动打开前端 |
-| `dsh-tray --port 8080` | 自定义端口 |
-| `dsh-tray --no-open` | 只起服务，不打开浏览器 |
-| `dsh-tray --stop` | 优雅停止已运行的实例 |
+```text
+dsh-tray                  使用 3080 端口并自动打开界面
+dsh-tray --port 8080      使用自定义端口
+dsh-tray --no-open        只启动服务，不打开界面
+dsh-tray --stop           请求正在运行的实例停止
+```
 
-服务日志：Windows `%TEMP%\dsh-tray-server.log`，macOS `/tmp/dsh-tray-server.log`
+日志位置：Windows `%TEMP%\\dsh-tray-server.log`；macOS `/tmp/dsh-tray-server.log`。
 
-## 自动发布
+## Chrome PWA（Windows）
 
-GitHub Actions 会在推送 `v*` tag 时自动构建并创建 Release（见 `.github/workflows/release.yml`）：
+首次使用时，如果 Chrome 中还没有安装 DSH PWA：
 
-| 平台 | 产物 |
-|------|------|
-| Windows x64 | `dsh-tray-setup-win-x64.exe`（Inno Setup 安装包）|
-| macOS Apple Silicon | `dsh-tray-osx-arm64.dmg` |
+1. 启动 `dsh-tray`
+2. Chrome 会打开本地 DSH 页面
+3. 点击地址栏右侧的“安装应用”，完成安装
+4. 以后启动会直接调用 Chrome 的 `chrome_proxy.exe` 打开 App 窗口
 
-> macOS 目前只构建 Apple Silicon（arm64）。Intel 版因 GitHub 已无配得上 .NET 10 的 Intel runner（Xcode 版本过旧），暂不提供。
+程序不会通过 `--install-app`、桌面快捷方式或 Chrome Policy 强制安装，因为这些方式在普通 Chrome 环境中并不可靠。
 
-## 自动更新
+## 插件和重启
 
-启动后会在后台查询 `api.github.com/repos/Binaryinject/dsh-tray/releases/latest`，与当前版本比较；发现新版本时弹窗询问，确认后下载对应平台的安装包并显示下载进度，完成后静默安装并重启：
+插件市场安装或更新插件后，通常需要重启 DSH 才能生效。请使用托盘菜单中的“重启服务”，由 dsh-tray 关闭旧 Node 进程并重新启动 `@deepseek-ai/dsh@next`。
 
-| 平台 | 更新方式 |
-|------|---------|
-| Windows | 下载 `dsh-tray-setup-win-x64.exe`，以 `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART` 静默安装，随后重新启动（无需 UAC）|
-| macOS | 下载 `dsh-tray-osx-arm64.dmg`，挂载后以 `ditto` 覆盖 `/Applications/dsh-tray.app` 并重新启动（若对 `/Applications` 无写权限需输入密码授权）|
+不要直接在另一个终端运行第二个 `dsh web`，否则会导致：
 
-> 检测与下载失败均为静默处理（仅在开始更新后失败时弹通知），不影响正常启动。检测的是 `latest` 稳定版，不含 prerelease。
+```text
+EADDRINUSE: address already in use 127.0.0.1:3080
+```
+
+启动时如果目标端口被旧的 DSH/Node 进程占用，dsh-tray 会自动结束该进程树后再启动新实例。也可以先执行 `dsh-tray --stop`，再重新启动 dsh-tray。
+
+## 发布
+
+推送 `v*` tag 后，GitHub Actions 会创建 Release：
+
+- Windows x64：`dsh-tray-setup-win-x64.exe`
+- macOS Apple Silicon：`dsh-tray-osx-arm64.dmg`
 
 ## 依赖
 
-运行时依赖 `npx`（Node.js）来解析并运行 `@deepseek-ai/dsh@next`（next 通道）；首次启动若本地未缓存该包会自动下载，安装确认会自动处理，无需在后台输入 `y`。
+运行时需要 Node.js（包含 `npx`）。DSH 使用 npm 的 `next` 通道：`@deepseek-ai/dsh@next`。首次启动可能需要下载依赖。
 
 ## License
 

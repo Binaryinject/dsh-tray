@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
+using System.Net.Sockets;
 using System.Net.Http;
 using System.Reflection;
 using System.Text;
@@ -308,6 +309,11 @@ namespace DshTray
 
         public void Start()
         {
+            if (PortIsOpen())
+            {
+                KillPortOwner();
+                WaitForPortClosed(5000);
+            }
             StartServer();
             StartPortWatcher();
             StartCommandListener();
@@ -503,6 +509,8 @@ namespace DshTray
             UpdateStatus("DeepSeek Harness — 服务正在重启…");
 
             StopServer();
+            KillPortOwner();
+            WaitForPortClosed(5000);
             StartServer();
             StartPortWatcher();
         }
@@ -725,6 +733,76 @@ namespace DshTray
             t.IsBackground = true;
             t.Start();
         }
+
+        private bool PortIsOpen()
+        {
+            using (TcpClient client = new TcpClient())
+            {
+                try
+                {
+                    IAsyncResult result = client.BeginConnect("127.0.0.1", port, null, null);
+                    if (!result.AsyncWaitHandle.WaitOne(300)) return false;
+                    client.EndConnect(result);
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+        }
+
+        private void WaitForPortClosed(int timeoutMs)
+        {
+            DateTime deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+            while (PortIsOpen() && DateTime.UtcNow < deadline)
+                Thread.Sleep(100);
+        }
+
+#if WINDOWS
+        private void KillPortOwner()
+        {
+            try
+            {
+                Process netstat = new Process();
+                netstat.StartInfo = new ProcessStartInfo("netstat.exe", "-ano -p tcp")
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true
+                };
+                netstat.Start();
+                string output = netstat.StandardOutput.ReadToEnd();
+                netstat.WaitForExit(2000);
+
+                string portSuffix = ":" + port;
+                string[] lines = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    string[] fields = lines[i].Split((char[])null, StringSplitOptions.RemoveEmptyEntries);
+                    if (fields.Length < 5 || !string.Equals(fields[0], "TCP", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!fields[1].EndsWith(portSuffix, StringComparison.OrdinalIgnoreCase)
+                        && !fields[2].EndsWith(portSuffix, StringComparison.OrdinalIgnoreCase)) continue;
+                    int pid;
+                    if (!int.TryParse(fields[fields.Length - 1], out pid) || pid <= 0 || pid == Process.GetCurrentProcess().Id) continue;
+
+                    Process killer = Process.Start(new ProcessStartInfo("taskkill.exe", "/PID " + pid + " /T /F")
+                    {
+                        UseShellExecute = false,
+                        CreateNoWindow = true
+                    });
+                    if (killer != null) killer.WaitForExit(3000);
+                }
+            }
+            catch
+            {
+            }
+        }
+#else
+        private void KillPortOwner()
+        {
+        }
+#endif
 
         private double GetNpmIdleSeconds()
         {
