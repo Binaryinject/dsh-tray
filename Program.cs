@@ -585,6 +585,7 @@ namespace DshTray
         {
             if (shuttingDown) return;
 
+            Log("[restart] restart requested");
             UpdateStatus("DeepSeek Harness — 服务正在重启…");
 
 #if WINDOWS
@@ -593,11 +594,13 @@ namespace DshTray
             // before tearing the service down.
             CloseDshChromeApps();
 #endif
+            Log("[restart] stopping server");
             StopServer();
             KillPortOwner();
             WaitForPortClosed(5000);
             StartServer();
             StartPortWatcher();
+            Log("[restart] server restarted");
         }
 
 #if WINDOWS
@@ -609,15 +612,19 @@ namespace DshTray
         /// URL on this tray's port --set by "open web page". Regular Chrome
         /// instances (no URL on the command line) never match.
         ///
-        /// Done purely in-process with Win32 APIs (no PowerShell/WMI/taskkill
-        /// subprocesses): some AV products (e.g. Huorong) flag hidden-run
-        /// script execution and would block it, leaving windows open.
+        /// Two channels, both in-process (no PowerShell/WMI/taskkill
+        /// subprocesses, which AV products like Huorong block):
+        ///   1. WM_CLOSE to the instance's visible top-level windows -- the
+        ///      graceful, AV-friendly way; chrome exits on its own.
+        ///   2. TerminateProcess as a fallback if the window did not close.
         /// </summary>
         private void CloseDshChromeApps()
         {
             try
             {
                 List<int> pids = FindProcessesByName("chrome.exe");
+                List<int> targets = new List<int>();
+                List<bool> targetIsApp = new List<bool>();
                 for (int i = 0; i < pids.Count; i++)
                 {
                     int pid = pids[i];
@@ -631,20 +638,154 @@ namespace DshTray
                         cmdline.IndexOf("--app-id=" + ChromeDshAppId, StringComparison.OrdinalIgnoreCase) >= 0
                         || cmdline.IndexOf("127.0.0.1:" + port, StringComparison.OrdinalIgnoreCase) >= 0
                         || cmdline.IndexOf("localhost:" + port, StringComparison.OrdinalIgnoreCase) >= 0;
-                    if (!isDsh) continue;
+                    if (isDsh)
+                    {
+                        targets.Add(pid);
+                        targetIsApp.Add(cmdline.IndexOf("--app-id=" + ChromeDshAppId, StringComparison.OrdinalIgnoreCase) >= 0);
+                    }
+                }
+                if (targets.Count == 0)
+                {
+                    Log("[close-app] no DSH chrome instance found");
+                    return;
+                }
+                Log("[close-app] matched " + targets.Count + " DSH chrome instance(s)");
 
-                    // Killing the browser process closes the whole instance;
-                    // its child processes exit when the IPC pipe dies.
+                // Channel 1: graceful close of the DSH windows only. The DSH
+                // page may share its Chrome instance with the user's other
+                // tabs, so match by window, never by process:
+                //   - PWA instance (--app-id): only App windows, i.e. window
+                //     titles WITHOUT the " - Google Chrome" tab suffix.
+                //   - URL instance: the tab window whose title carries the
+                //     DSH name or the service URL.
+                for (int i = 0; i < targets.Count; i++)
+                {
+                    pendingClosePort = port;
+                    pendingCloseIsApp = targetIsApp[i];
+                    PostCloseToWindows(targets[i]);
+                    Log("[close-app] WM_CLOSE sent to instance pid " + targets[i]);
+                }
+                Thread.Sleep(1500);
+
+                // Channel 2: force-kill a browser process only when no other
+                // window remains (empty instance after the DSH window closed).
+                for (int i = 0; i < targets.Count; i++)
+                {
+                    int pid = targets[i];
+                    if (!IsProcessAlive(pid)) continue;
+                    if (ProcessHasVisibleWindow(pid)) continue;
                     IntPtr handle = OpenProcessWin32(ProcessTerminate, false, (uint)pid);
                     if (handle == IntPtr.Zero) continue;
                     try { TerminateProcess(handle, 1); }
                     finally { CloseHandle(handle); }
+                    Log("[close-app] force-killed empty instance pid " + pid);
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                // Never silent: surface what failed so the close path can be
+                // diagnosed from the log.
+                Log("[close-app] ERROR: " + ex.ToString().Replace(Environment.NewLine, " | "));
             }
         }
+
+        private const uint WmCloseMsg = 0x0010;
+        private static int pendingClosePort;
+        private static bool pendingCloseIsApp;
+
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        // Keep the delegates alive across the EnumWindows calls.
+        private static readonly EnumWindowsProc EnumWindowsHandler = EnumWindowsCallback;
+        private static readonly EnumWindowsProc HasWindowHandler = HasWindowCallback;
+
+        private static bool EnumWindowsCallback(IntPtr hWnd, IntPtr lParam)
+        {
+            uint pid;
+            GetWindowThreadProcessId(hWnd, out pid);
+            if (pid != (uint)lParam.ToInt64() || !IsWindowVisible(hWnd)) return true;
+            string title = GetWindowTitle(hWnd);
+            if (string.IsNullOrEmpty(title)) return true;
+
+            // Regular Chrome tab windows always carry this suffix; PWA App
+            // windows do not. With the suffix stripped, "DeepSeek Harness"
+            // appears in the app title instead of the repo name below it.
+            bool tabWindow = title.EndsWith(" - Google Chrome", StringComparison.OrdinalIgnoreCase);
+            bool dshTitle =
+                title.StartsWith("DeepSeek Harness - ", StringComparison.OrdinalIgnoreCase)
+                || title.IndexOf("127.0.0.1:" + pendingClosePort, StringComparison.OrdinalIgnoreCase) >= 0
+                || title.IndexOf("localhost:" + pendingClosePort, StringComparison.OrdinalIgnoreCase) >= 0;
+
+            bool close = pendingCloseIsApp ? (!tabWindow && dshTitle) : dshTitle;
+            if (close) PostMessage(hWnd, WmCloseMsg, IntPtr.Zero, IntPtr.Zero);
+            return true;
+        }
+
+        private static bool HasWindowCallback(IntPtr hWnd, IntPtr lParam)
+        {
+            uint pid;
+            GetWindowThreadProcessId(hWnd, out pid);
+            if (pid == (uint)lParam.ToInt64() && IsWindowVisible(hWnd)) return false; // stop at first match
+            return true;
+        }
+
+        private static void PostCloseToWindows(int processId)
+        {
+            EnumWindows(EnumWindowsHandler, new IntPtr(processId));
+        }
+
+        private static bool ProcessHasVisibleWindow(int processId)
+        {
+            int matches = 0;
+            EnumWindows(delegate (IntPtr hWnd, IntPtr lParam)
+            {
+                uint pid;
+                GetWindowThreadProcessId(hWnd, out pid);
+                if (pid == (uint)lParam.ToInt64() && IsWindowVisible(hWnd)) { matches++; return false; }
+                return true;
+            }, new IntPtr(processId));
+            return matches > 0;
+        }
+
+        private static string GetWindowTitle(IntPtr hWnd)
+        {
+            int len = GetWindowTextLength(hWnd);
+            if (len <= 0) return null;
+            StringBuilder sb = new StringBuilder(len + 2);
+            GetWindowText(hWnd, sb, sb.Capacity);
+            return sb.ToString();
+        }
+
+        private static bool IsProcessAlive(int processId)
+        {
+            IntPtr handle = OpenProcessWin32(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, false, (uint)processId);
+            if (handle == IntPtr.Zero)
+            {
+                // ERROR_INVALID_PARAMETER (87) means the pid is gone;
+                // anything else (e.g. access denied) means it still exists.
+                return Marshal.GetLastWin32Error() != 87;
+            }
+            CloseHandle(handle);
+            return true;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetWindowTextLength(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         private struct ProcessEntry32
@@ -781,7 +922,7 @@ namespace DshTray
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr handle);
 
-        [DllImport("kernel32.dll", SetLastError = true)]
+        [DllImport("kernel32.dll", EntryPoint = "OpenProcess", SetLastError = true)]
         private static extern IntPtr OpenProcessWin32(int access, bool inheritHandle, uint processId);
 
         [DllImport("ntdll.dll")]

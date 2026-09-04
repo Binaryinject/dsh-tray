@@ -4,7 +4,7 @@
 set -euo pipefail
 
 RID="$1"
-VERSION="${2:-0.1.11}"
+VERSION="${2:-0.1.12}"
 
 BASE="bin/Release/net10.0-macos"
 APP="dsh-tray.app"
