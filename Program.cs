@@ -6,6 +6,7 @@ using System.IO.Pipes;
 using System.Net.Sockets;
 using System.Net.Http;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 
@@ -162,9 +163,15 @@ namespace DshTray
         /// <summary>Query the latest stable release. Returns null on error or no usable asset.</summary>
         internal static ReleaseInfo CheckLatest()
         {
+            return CheckLatest(30);
+        }
+
+        /// <summary>Query the latest stable release with a custom timeout (used for the pre-start prompt).</summary>
+        internal static ReleaseInfo CheckLatest(int timeoutSeconds)
+        {
             using (HttpClient client = new HttpClient())
             {
-                client.Timeout = TimeSpan.FromSeconds(30);
+                client.Timeout = TimeSpan.FromSeconds(timeoutSeconds);
                 client.DefaultRequestHeaders.UserAgent.ParseAdd("dsh-tray");
                 client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
                 using (HttpResponseMessage resp = client.GetAsync(ApiUrl).GetAwaiter().GetResult())
@@ -317,11 +324,15 @@ namespace DshTray
             StartServer();
             StartPortWatcher();
             StartCommandListener();
-            StartSelfUpdateCheck();
         }
 
-        /// <summary>Kick off a background check for a newer GitHub release.</summary>
-        private void StartSelfUpdateCheck()
+        /// <summary>
+        /// Kick off a background check for a newer GitHub release. Used by the
+        /// macOS backend; the Windows backend asks about updates synchronously
+        /// BEFORE starting the service (see Platform.PromptUpdateBeforeStart),
+        /// so an in-place update does not boot the old service first.
+        /// </summary>
+        public void CheckSelfUpdateAsync()
         {
             Thread t = new Thread(delegate ()
             {
@@ -597,37 +608,192 @@ namespace DshTray
         /// installed DSH app id (PWA launched via chrome_proxy --app-id) or a
         /// URL on this tray's port --set by "open web page". Regular Chrome
         /// instances (no URL on the command line) never match.
+        ///
+        /// Done purely in-process with Win32 APIs (no PowerShell/WMI/taskkill
+        /// subprocesses): some AV products (e.g. Huorong) flag hidden-run
+        /// script execution and would block it, leaving windows open.
         /// </summary>
         private void CloseDshChromeApps()
         {
             try
             {
-                // Only browser processes (no --type=): killing the browser
-                // process tree closes that instance's windows cleanly.
-                string ps =
-                    "$ids = Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | " +
-                    "Where-Object { $_.CommandLine -notmatch '--type=' -and (" +
-                    "$_.CommandLine -match '--app-id=" + ChromeDshAppId + "' -or " +
-                    "$_.CommandLine -match '127\\.0\\.0\\.1:" + port + "' -or " +
-                    "$_.CommandLine -match 'localhost:" + port + "') } | " +
-                    "ForEach-Object { $_.ProcessId }; " +
-                    "foreach ($id in $ids) { & taskkill /PID $id /T /F 2>$null | Out-Null }";
+                List<int> pids = FindProcessesByName("chrome.exe");
+                for (int i = 0; i < pids.Count; i++)
+                {
+                    int pid = pids[i];
+                    string cmdline = ReadProcessCommandLine(pid);
+                    if (string.IsNullOrEmpty(cmdline)) continue;
+                    // Sub-processes (renderer/gpu/...) carry --type=; only the
+                    // browser process has the app/URL switches we match.
+                    if (cmdline.IndexOf("--type=", StringComparison.OrdinalIgnoreCase) >= 0) continue;
 
-                ProcessStartInfo psi = new ProcessStartInfo("powershell.exe");
-                psi.UseShellExecute = false;
-                psi.CreateNoWindow = true;
-                psi.ArgumentList.Add("-NoProfile");
-                psi.ArgumentList.Add("-WindowStyle");
-                psi.ArgumentList.Add("Hidden");
-                psi.ArgumentList.Add("-Command");
-                psi.ArgumentList.Add(ps);
-                Process p = Process.Start(psi);
-                if (p != null) p.WaitForExit(15000);
+                    bool isDsh =
+                        cmdline.IndexOf("--app-id=" + ChromeDshAppId, StringComparison.OrdinalIgnoreCase) >= 0
+                        || cmdline.IndexOf("127.0.0.1:" + port, StringComparison.OrdinalIgnoreCase) >= 0
+                        || cmdline.IndexOf("localhost:" + port, StringComparison.OrdinalIgnoreCase) >= 0;
+                    if (!isDsh) continue;
+
+                    // Killing the browser process closes the whole instance;
+                    // its child processes exit when the IPC pipe dies.
+                    IntPtr handle = OpenProcessWin32(ProcessTerminate, false, (uint)pid);
+                    if (handle == IntPtr.Zero) continue;
+                    try { TerminateProcess(handle, 1); }
+                    finally { CloseHandle(handle); }
+                }
             }
             catch
             {
             }
         }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct ProcessEntry32
+        {
+            public uint dwSize;
+            public uint cntUsage;
+            public uint th32ProcessID;
+            public IntPtr th32DefaultHeapID;
+            public uint th32ModuleID;
+            public uint cntThreads;
+            public uint th32ParentProcessID;
+            public int pcPriClassBase;
+            public uint dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+            public string szExeFile;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ProcessBasicInformation
+        {
+            public IntPtr Reserved1;
+            public IntPtr PebBaseAddress;
+            public IntPtr Reserved2;
+            public IntPtr Reserved3;
+            public IntPtr UniqueProcessId;
+            public IntPtr Reserved4;
+        }
+
+        private const uint Th32csSnapprocess = 0x2;
+        private const int ProcessVmRead = 0x0010;
+        private const int ProcessQueryInformation = 0x0400;
+        private const int ProcessTerminate = 0x0001;
+
+        private static List<int> FindProcessesByName(string imageName)
+        {
+            List<int> result = new List<int>();
+            IntPtr snapshot = CreateToolhelp32Snapshot(Th32csSnapprocess, 0);
+            if (snapshot == IntPtr.Zero || snapshot == new IntPtr(-1)) return result;
+            try
+            {
+                ProcessEntry32 entry = new ProcessEntry32();
+                entry.dwSize = (uint)Marshal.SizeOf<ProcessEntry32>();
+                if (Process32First(snapshot, ref entry))
+                {
+                    do
+                    {
+                        if (string.Equals(entry.szExeFile, imageName, StringComparison.OrdinalIgnoreCase))
+                            result.Add((int)entry.th32ProcessID);
+                    }
+                    while (Process32Next(snapshot, ref entry));
+                }
+            }
+            finally
+            {
+                CloseHandle(snapshot);
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Read another process's command line via its PEB.
+        /// x64 layout only (the tray and its target Chrome are win-x64);
+        /// returns null on any failure (access denied, 32-bit process, ...).
+        /// </summary>
+        private static string ReadProcessCommandLine(int processId)
+        {
+            IntPtr proc = OpenProcessWin32(ProcessQueryInformation | ProcessVmRead, false, (uint)processId);
+            if (proc == IntPtr.Zero || proc == new IntPtr(-1)) return null;
+            try
+            {
+                ProcessBasicInformation pbi;
+                int retLen;
+                int status = NtQueryInformationProcess(proc, 0, out pbi,
+                    Marshal.SizeOf<ProcessBasicInformation>(), out retLen);
+                if (status != 0 || pbi.PebBaseAddress == IntPtr.Zero) return null;
+
+                // PEB -> ProcessParameters (x64: 0x20)
+                IntPtr parameters = ReadProcessPointer(proc, pbi.PebBaseAddress, 0x20);
+                if (parameters == IntPtr.Zero) return null;
+
+                // RTL_USER_PROCESS_PARAMETERS.CommandLine (x64: offset 0x70):
+                // the UNICODE_STRING lives there, so read it by address.
+                IntPtr commandLine = parameters + 0x70;
+
+                // UNICODE_STRING: Length (ushort @0), padding (0-1), Buffer (x64: offset 8)
+                byte[] raw = new byte[16];
+                if (!ReadProcessBytes(proc, commandLine, raw, raw.Length)) return null;
+                int length = raw[0] | (raw[1] << 8);
+                if (length <= 0) return null;
+                IntPtr buffer = new IntPtr(BitConverter.ToInt64(raw, 8));
+                byte[] chars = new byte[length];
+                if (!ReadProcessBytes(proc, buffer, chars, chars.Length)) return null;
+                return Encoding.Unicode.GetString(chars);
+            }
+            finally
+            {
+                CloseHandle(proc);
+            }
+        }
+
+        private static IntPtr ReadProcessPointer(IntPtr proc, IntPtr address, int offset)
+        {
+            byte[] buf = new byte[IntPtr.Size];
+            if (!ReadProcessBytes(proc, address + offset, buf, buf.Length)) return IntPtr.Zero;
+            long value = IntPtr.Size == 8 ? BitConverter.ToInt64(buf, 0) : BitConverter.ToInt32(buf, 0);
+            return new IntPtr(value);
+        }
+
+        private static bool ReadProcessBytes(IntPtr proc, IntPtr address, byte[] buffer, int count)
+        {
+            if (count == 0) return true;
+            GCHandle pinned = GCHandle.Alloc(buffer, GCHandleType.Pinned);
+            try
+            {
+                IntPtr read;
+                if (!ReadProcessMemory(proc, address, pinned.AddrOfPinnedObject(), count, out read)) return false;
+                return read.ToInt64() == count;
+            }
+            finally
+            {
+                pinned.Free();
+            }
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool Process32First(IntPtr snapshot, ref ProcessEntry32 entry);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool Process32Next(IntPtr snapshot, ref ProcessEntry32 entry);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcessWin32(int access, bool inheritHandle, uint processId);
+
+        [DllImport("ntdll.dll")]
+        private static extern int NtQueryInformationProcess(IntPtr processHandle, int processInformationClass,
+            out ProcessBasicInformation processInformation, int processInformationLength, out int returnLength);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool ReadProcessMemory(IntPtr processHandle, IntPtr baseAddress,
+            IntPtr buffer, int size, out IntPtr bytesRead);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateProcess(IntPtr processHandle, uint exitCode);
 #endif
 
         private void StartServer()

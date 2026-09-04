@@ -70,6 +70,7 @@ namespace DshTray
         private const int WS_CAPTION = 0x00C00000;
         private const int WS_SYSMENU = 0x00080000;
         private const int SW_HIDE = 0;
+        private const int SW_SHOW = 5;
         private const int SW_SHOWNOACTIVATE = 4;
         private const int SM_CXSCREEN = 0;
         private const int SM_CYSCREEN = 1;
@@ -91,16 +92,22 @@ namespace DshTray
         private static Core core;
         private static IntPtr hwnd;
         private static IntPtr progressHwnd;
+        private static IntPtr updatePromptHwnd;
         private static IntPtr hIcon;
         private static IntPtr headingFont;
         private static IntPtr bodyFont;
         private static IntPtr logFont;
+        private static IntPtr promptTitleFont;
+        private static IntPtr promptBodyFont;
         private static string currentProgressStage = "正在准备更新…";
         private static string currentProgressDetail = "等待 npm 输出…";
         private static bool progressIsCompleted;
         private static int progressAnimationOffset;
         private static int hoveredProgressButton;
         private static int pressedProgressButton;
+        private static int updatePromptResult = -1;
+        private static int hoveredPromptButton;
+        private static int pressedPromptButton;
         private static bool useDarkTheme;
         private static readonly object trayLock = new object();
         private static readonly object notificationLock = new object();
@@ -140,7 +147,20 @@ namespace DshTray
             c.SelfUpdateDownloaded = QueueUpdateDownloaded;
             c.SelfUpdateFailed = QueueUpdateFailed;
 
-            c.Start();
+            // Ask about updates BEFORE starting the service: when the user
+            // picks "update now", the installer flow relaunches the app and
+            // the service must not boot against the old version.
+            if (PromptUpdateBeforeStart())
+            {
+                serviceStarted = false;
+                SetUpdateProgressUI(0, "开始下载更新…");
+                core.BeginSelfUpdateDownload(pendingUpdateDownloadUrl);
+            }
+            else
+            {
+                serviceStarted = true;
+                c.Start();
+            }
 
             MSG msg;
             while (GetMessage(out msg, IntPtr.Zero, 0, 0) > 0)
@@ -263,6 +283,85 @@ namespace DshTray
             if (msg == WM_APP_UPDATE_FAILED)
             {
                 DrainUpdateFailed();
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == updatePromptHwnd && msg == WM_CLOSE)
+            {
+                // Treat close / ESC as "skip": start the service normally.
+                updatePromptResult = 1;
+                ShowWindow(updatePromptHwnd, SW_HIDE);
+                PostMessage(hwnd, WM_NULL, IntPtr.Zero, IntPtr.Zero);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == updatePromptHwnd && msg == WM_LBUTTONUP)
+            {
+                int x = (short)((long)lParam & 0xffff);
+                int y = (short)(((long)lParam >> 16) & 0xffff);
+                int button = GetPromptButtonAt(x, y);
+                int clicked = pressedPromptButton == button ? button : 0;
+                pressedPromptButton = 0;
+                ReleaseCapture();
+                InvalidateRect(updatePromptHwnd, IntPtr.Zero, false);
+                if (clicked == 1) updatePromptResult = 0; // update now
+                else if (clicked == 2) updatePromptResult = 1; // skip
+                if (updatePromptResult != -1)
+                {
+                    ShowWindow(updatePromptHwnd, SW_HIDE);
+                    PostMessage(hwnd, WM_NULL, IntPtr.Zero, IntPtr.Zero);
+                }
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == updatePromptHwnd && msg == WM_LBUTTONDOWN)
+            {
+                int x = (short)((long)lParam & 0xffff);
+                int y = (short)(((long)lParam >> 16) & 0xffff);
+                pressedPromptButton = GetPromptButtonAt(x, y);
+                if (pressedPromptButton != 0) SetCapture(updatePromptHwnd);
+                InvalidateRect(updatePromptHwnd, IntPtr.Zero, false);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == updatePromptHwnd && msg == WM_MOUSEMOVE)
+            {
+                int x = (short)((long)lParam & 0xffff);
+                int y = (short)(((long)lParam >> 16) & 0xffff);
+                int button = GetPromptButtonAt(x, y);
+                if (button != hoveredPromptButton)
+                {
+                    hoveredPromptButton = button;
+                    InvalidateRect(updatePromptHwnd, IntPtr.Zero, false);
+                }
+                if (button != 0) SetCursor(LoadCursor(IntPtr.Zero, (IntPtr)IDC_HAND));
+                TRACKMOUSEEVENT tracking = new TRACKMOUSEEVENT();
+                tracking.cbSize = (uint)Marshal.SizeOf<TRACKMOUSEEVENT>();
+                tracking.dwFlags = TME_LEAVE;
+                tracking.hwndTrack = updatePromptHwnd;
+                TrackMouseEvent(ref tracking);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == updatePromptHwnd && msg == WM_MOUSELEAVE)
+            {
+                hoveredPromptButton = 0;
+                if (pressedPromptButton == 0) InvalidateRect(updatePromptHwnd, IntPtr.Zero, false);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == updatePromptHwnd && msg == WM_PAINT)
+            {
+                PaintUpdatePrompt();
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == updatePromptHwnd && msg == WM_ERASEBKGND) return (IntPtr)1;
+
+            if (hWnd == updatePromptHwnd && msg == WM_SETTINGCHANGE)
+            {
+                RefreshSystemTheme();
+                InvalidateRect(updatePromptHwnd, IntPtr.Zero, false);
                 return IntPtr.Zero;
             }
 
@@ -444,6 +543,157 @@ namespace DshTray
             if (hwnd != IntPtr.Zero) PostMessage(hwnd, WM_APP_STATUS, IntPtr.Zero, IntPtr.Zero);
         }
 
+        /// <summary>
+        /// Pre-start update gate: check for a newer release synchronously and
+        /// show the skinned dialog. Returns true when the user chose
+        /// "update now" (the service must NOT start in that case).
+        /// </summary>
+        private static bool PromptUpdateBeforeStart()
+        {
+            SelfUpdater.ReleaseInfo info;
+            try
+            {
+                info = SelfUpdater.CheckLatest(15);
+            }
+            catch
+            {
+                return false; // no network: just start
+            }
+            if (info == null || info.Version == null) return false;
+            Version current = SelfUpdater.TryParseVersion(SelfUpdater.GetCurrentVersion());
+            if (current == null || info.Version <= current) return false;
+
+            lock (updateLock)
+            {
+                pendingUpdateTag = info.Tag;
+                pendingUpdateDownloadUrl = info.DownloadUrl;
+            }
+            int choice = ShowUpdatePromptDialog(info.Tag, current);
+            return choice == 0;
+        }
+
+        /// <summary>
+        /// Skinned (in-place painted) modal dialog: "update now" or "skip".
+        /// Runs its own message loop on the UI thread; the window is reused
+        /// (hidden, never destroyed) to avoid a stray WM_QUIT.
+        /// </summary>
+        private static int ShowUpdatePromptDialog(string latestTag, Version current)
+        {
+            if (updatePromptHwnd == IntPtr.Zero)
+            {
+                const int width = 460;
+                const int height = 214;
+                int x = Math.Max(0, (GetSystemMetrics(SM_CXSCREEN) - width) / 2);
+                int y = Math.Max(0, (GetSystemMetrics(SM_CYSCREEN) - height) / 3);
+                IntPtr hInstance = GetModuleHandle(null);
+                updatePromptHwnd = CreateWindowEx(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, ClassName,
+                    "DeepSeek Harness 更新", WS_CAPTION | WS_SYSMENU,
+                    x, y, width, height, IntPtr.Zero, IntPtr.Zero, hInstance, IntPtr.Zero);
+                if (updatePromptHwnd == IntPtr.Zero) return 1;
+                SendMessage(updatePromptHwnd, 0x0080, (IntPtr)1, hIcon); // WM_SETICON / ICON_BIG
+                RefreshSystemTheme();
+                promptTitleFont = CreateUiFont(-22, 600, "Microsoft YaHei UI");
+                promptBodyFont = CreateUiFont(-13, 400, "Microsoft YaHei UI");
+            }
+
+            pendingPromptTag = latestTag;
+            pendingPromptCurrentVersion = current.ToString();
+            updatePromptResult = -1;
+            hoveredPromptButton = 0;
+            pressedPromptButton = 0;
+            InvalidateRect(updatePromptHwnd, IntPtr.Zero, false);
+            ShowWindow(updatePromptHwnd, SW_SHOW);
+            SetForegroundWindow(updatePromptHwnd);
+
+            MSG msg;
+            while (updatePromptResult == -1 && GetMessage(out msg, IntPtr.Zero, 0, 0) > 0)
+            {
+                TranslateMessage(ref msg);
+                DispatchMessage(ref msg);
+            }
+
+            ShowWindow(updatePromptHwnd, SW_HIDE);
+            return updatePromptResult;
+        }
+
+        private static RECT GetUpdateButtonRect(RECT client)
+        {
+            return new RECT(client.Right - 144, client.Bottom - 56, client.Right - 24, client.Bottom - 20);
+        }
+
+        private static RECT GetSkipButtonRect(RECT client)
+        {
+            return new RECT(client.Right - 274, client.Bottom - 56, client.Right - 154, client.Bottom - 20);
+        }
+
+        private static int GetPromptButtonAt(int x, int y)
+        {
+            RECT client;
+            GetClientRect(updatePromptHwnd, out client);
+            if (PointInRect(GetUpdateButtonRect(client), x, y)) return 1;
+            if (PointInRect(GetSkipButtonRect(client), x, y)) return 2;
+            return 0;
+        }
+
+        private static void PaintUpdatePrompt()
+        {
+            PAINTSTRUCT paint;
+            IntPtr target = BeginPaint(updatePromptHwnd, out paint);
+            if (target == IntPtr.Zero) return;
+
+            RECT client;
+            GetClientRect(updatePromptHwnd, out client);
+            IntPtr buffer = CreateCompatibleDC(target);
+            IntPtr bitmap = CreateCompatibleBitmap(target, client.Right, client.Bottom);
+            IntPtr oldBitmap = SelectObject(buffer, bitmap);
+
+            int background = useDarkTheme ? Rgb(31, 33, 36) : Rgb(250, 251, 252);
+            int heading = useDarkTheme ? Rgb(242, 244, 246) : Rgb(24, 29, 35);
+            int secondary = useDarkTheme ? Rgb(169, 176, 184) : Rgb(91, 99, 108);
+            int accent = useDarkTheme ? Rgb(45, 169, 151) : Rgb(23, 126, 113);
+            FillColor(buffer, client, background);
+
+            RECT titleRect = new RECT(24, 24, client.Right - 24, 58);
+            DrawLabel(buffer, "发现新版本 " + (pendingPromptTag ?? ""), titleRect, promptTitleFont, heading,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+            RECT bodyRect = new RECT(24, 68, client.Right - 24, client.Bottom - 72);
+            DrawLabel(buffer,
+                "当前版本 " + (pendingPromptCurrentVersion ?? "0.0.0") + "。\n是否立即下载并更新？\n\n选择“立即更新”会先更新并重启，\n服务在新版本启动时开启；\n选择“稍后启动”则立即启动服务。",
+                bodyRect, promptBodyFont, secondary,
+                DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+            RECT updateRect = GetUpdateButtonRect(client);
+            int updateColor = useDarkTheme
+                ? (pressedPromptButton == 1 ? Rgb(25, 126, 112)
+                    : hoveredPromptButton == 1 ? Rgb(54, 186, 166) : accent)
+                : (pressedPromptButton == 1 ? Rgb(12, 91, 82)
+                    : hoveredPromptButton == 1 ? Rgb(15, 110, 99) : accent);
+            FillRounded(buffer, updateRect, 6, updateColor);
+            DrawLabel(buffer, "立即更新", updateRect, promptBodyFont, Rgb(255, 255, 255),
+                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | 0x0001);
+
+            RECT skipRect = GetSkipButtonRect(client);
+            int skipColor = useDarkTheme
+                ? (pressedPromptButton == 2 ? Rgb(83, 89, 96)
+                    : hoveredPromptButton == 2 ? Rgb(70, 76, 82) : Rgb(55, 60, 66))
+                : (pressedPromptButton == 2 ? Rgb(205, 211, 216)
+                    : hoveredPromptButton == 2 ? Rgb(218, 223, 227) : Rgb(232, 235, 238));
+            FillRounded(buffer, skipRect, 6, skipColor);
+            DrawLabel(buffer, "稍后启动", skipRect, promptBodyFont,
+                useDarkTheme ? Rgb(242, 244, 246) : Rgb(38, 44, 51),
+                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | 0x0001);
+
+            BitBlt(target, 0, 0, client.Right, client.Bottom, buffer, 0, 0, SRCCOPY);
+            SelectObject(buffer, oldBitmap);
+            DeleteObject(bitmap);
+            DeleteDC(buffer);
+            EndPaint(updatePromptHwnd, ref paint);
+        }
+
+        private static string pendingPromptTag;
+        private static string pendingPromptCurrentVersion;
+
         private static void DrainStatus()
         {
             string text;
@@ -599,6 +849,11 @@ namespace DshTray
             if (hwnd != IntPtr.Zero) PostMessage(hwnd, WM_APP_UPDATE_FAILED, IntPtr.Zero, IntPtr.Zero);
         }
 
+        /// <summary>True once the dsh web service has been started (or the
+        /// user skipped the update); false while an update was chosen and the
+        /// service is deliberately kept stopped.</summary>
+        private static bool serviceStarted;
+
         private static void DrainUpdateFailed()
         {
             string reason;
@@ -615,6 +870,14 @@ namespace DshTray
                 InvalidateRect(progressHwnd, IntPtr.Zero, false);
             }
             QueueNotification("DeepSeek Harness", "自动更新失败：" + (string.IsNullOrEmpty(reason) ? "未知错误" : reason));
+
+            // The service was held back for the update; start it now instead
+            // of leaving the tray without a service.
+            if (!serviceStarted)
+            {
+                serviceStarted = true;
+                core.Start();
+            }
         }
 
         private static void LaunchWindowsInstaller(string installerPath)
@@ -958,9 +1221,16 @@ namespace DshTray
                 DestroyWindow(progressHwnd);
                 progressHwnd = IntPtr.Zero;
             }
+            if (updatePromptHwnd != IntPtr.Zero)
+            {
+                DestroyWindow(updatePromptHwnd);
+                updatePromptHwnd = IntPtr.Zero;
+            }
             if (headingFont != IntPtr.Zero) { DeleteObject(headingFont); headingFont = IntPtr.Zero; }
             if (bodyFont != IntPtr.Zero) { DeleteObject(bodyFont); bodyFont = IntPtr.Zero; }
             if (logFont != IntPtr.Zero) { DeleteObject(logFont); logFont = IntPtr.Zero; }
+            if (promptTitleFont != IntPtr.Zero) { DeleteObject(promptTitleFont); promptTitleFont = IntPtr.Zero; }
+            if (promptBodyFont != IntPtr.Zero) { DeleteObject(promptBodyFont); promptBodyFont = IntPtr.Zero; }
             if (hIcon != IntPtr.Zero)
             {
                 DestroyIcon(hIcon);

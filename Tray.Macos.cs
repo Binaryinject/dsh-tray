@@ -113,6 +113,9 @@ namespace DshTray
             };
 
             c.Start();
+            // Background update check (the Windows backend asks about updates
+            // synchronously before starting the service).
+            c.CheckSelfUpdateAsync();
 
             app.Run();
             core.Shutdown();
