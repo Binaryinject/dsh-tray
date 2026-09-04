@@ -29,7 +29,6 @@ namespace DshTray
         private const uint WM_RBUTTONUP = 0x0205;
         private const uint WM_TRAYICON = 0x0401;
         private const uint WM_APP_EXIT = 0x8001;
-        private const uint WM_APP_NOTIFY = 0x8002;
         private const uint WM_APP_STATUS = 0x8003;
         private const uint WM_APP_PROGRESS = 0x8004;
         private const uint WM_APP_UPDATE_AVAILABLE = 0x8005;
@@ -63,10 +62,6 @@ namespace DshTray
         private const uint NIF_MESSAGE = 0x00000001;
         private const uint NIF_ICON = 0x00000002;
         private const uint NIF_TIP = 0x00000004;
-        private const uint NIF_INFO = 0x00000010;
-
-        private const uint NIIF_INFO = 0x00000001;
-        private const uint NIIF_WARNING = 0x00000002;
 
         private const int IDI_APPLICATION = 32512;
 
@@ -105,7 +100,6 @@ namespace DshTray
         private static IntPtr promptTitleFont;
         private static IntPtr promptBodyFont;
         private static string currentProgressStage = "正在准备更新…";
-        private static string currentProgressDetail = "等待 npm 输出…";
         private static bool progressIsCompleted;
         private static int progressAnimationOffset;
         private static int hoveredProgressButton;
@@ -115,9 +109,11 @@ namespace DshTray
         private static int pressedPromptButton;
         private static bool useDarkTheme;
         private static readonly object trayLock = new object();
-        private static readonly object notificationLock = new object();
         private static readonly object statusLock = new object();
         private static readonly object progressLock = new object();
+        private static readonly List<string> progressLogLines = new List<string>();
+        private const int MaxProgressLogLines = 400;
+        private static bool pendingProgressNotify;
         private static string pendingStatus;
         private static string currentStatus = "DeepSeek Harness";
         private static string pendingProgressStage;
@@ -126,7 +122,6 @@ namespace DshTray
         private static bool pendingProgressStarted;
         private static bool hasUpdateProgress;
         private static bool progressDismissedByUser;
-        private static readonly Queue<Tuple<string, string>> pendingNotifications = new Queue<Tuple<string, string>>();
         private static readonly object updateLock = new object();
         private static string pendingUpdateTag;
         private static string pendingUpdateDownloadUrl;
@@ -252,12 +247,6 @@ namespace DshTray
             if (msg == WM_APP_EXIT)
             {
                 Shutdown();
-                return IntPtr.Zero;
-            }
-
-            if (msg == WM_APP_NOTIFY)
-            {
-                DrainNotifications();
                 return IntPtr.Zero;
             }
 
@@ -523,30 +512,16 @@ namespace DshTray
 
         private static void QueueNotification(string title, string text)
         {
-            lock (notificationLock)
+            AppendProgressLog(text);
+            lock (progressLock)
             {
-                pendingNotifications.Enqueue(Tuple.Create(title, text));
+                hasUpdateProgress = true;
+                pendingProgressNotify = true;
             }
-
             // Core can call Notify from npx output / port-watcher threads, so marshal
-            // the actual Shell_NotifyIcon call back to the tray window's UI thread.
-            if (hwnd != IntPtr.Zero) PostMessage(hwnd, WM_APP_NOTIFY, IntPtr.Zero, IntPtr.Zero);
+            // the window update back to the tray window's UI thread.
+            if (hwnd != IntPtr.Zero) PostMessage(hwnd, WM_APP_PROGRESS, IntPtr.Zero, IntPtr.Zero);
         }
-
-        private static void DrainNotifications()
-        {
-            while (true)
-            {
-                Tuple<string, string> n;
-                lock (notificationLock)
-                {
-                    if (pendingNotifications.Count == 0) return;
-                    n = pendingNotifications.Dequeue();
-                }
-                ShowBalloon(n.Item1, n.Item2, NIIF_INFO);
-            }
-        }
-
 
         private static void QueueStatus(string text)
         {
@@ -817,10 +792,10 @@ namespace DshTray
             EnsureProgressWindow();
             if (progressHwnd == IntPtr.Zero) return;
             currentProgressStage = "正在下载更新…";
-            currentProgressDetail = detail;
             currentProgressPercent = percent;
             progressDismissedByUser = false;
             progressIsCompleted = false;
+            AppendProgressLog("下载进度：" + detail);
             InvalidateRect(progressHwnd, IntPtr.Zero, false);
             ShowProgressWindow();
         }
@@ -846,9 +821,9 @@ namespace DshTray
             if (progressHwnd != IntPtr.Zero)
             {
                 currentProgressStage = "已下载，正在安装并重启…";
-                currentProgressDetail = "即将静默安装并重新启动。";
                 currentProgressPercent = 100;
                 progressIsCompleted = false;
+                AppendProgressLog("即将静默安装并重新启动。");
                 InvalidateRect(progressHwnd, IntPtr.Zero, false);
                 ShowProgressWindow();
             }
@@ -881,9 +856,9 @@ namespace DshTray
             if (progressHwnd != IntPtr.Zero)
             {
                 currentProgressStage = "更新失败";
-                currentProgressDetail = string.IsNullOrEmpty(reason) ? "未知错误" : reason;
                 currentProgressPercent = -1;
                 progressIsCompleted = false;
+                AppendProgressLog("更新失败：" + (string.IsNullOrEmpty(reason) ? "未知错误" : reason));
                 InvalidateRect(progressHwnd, IntPtr.Zero, false);
             }
             QueueNotification("DeepSeek Harness", "自动更新失败：" + (string.IsNullOrEmpty(reason) ? "未知错误" : reason));
@@ -937,15 +912,22 @@ namespace DshTray
             string detail;
             bool completed;
             bool started;
+            bool notify;
             lock (progressLock)
             {
                 stage = pendingProgressStage;
+                pendingProgressStage = null;
                 detail = pendingProgressDetail;
+                pendingProgressDetail = null;
                 completed = pendingProgressCompleted;
                 started = pendingProgressStarted;
                 pendingProgressCompleted = false;
                 pendingProgressStarted = false;
+                notify = pendingProgressNotify;
+                pendingProgressNotify = false;
             }
+
+            if (!string.IsNullOrWhiteSpace(detail)) AppendProgressLog(detail);
 
             EnsureProgressWindow();
             if (progressHwnd == IntPtr.Zero) return;
@@ -956,7 +938,6 @@ namespace DshTray
                 currentProgressPercent = -1;
             }
             if (stage != null) currentProgressStage = stage;
-            if (detail != null) currentProgressDetail = TrimProgressDetail(detail);
 
             if (completed)
             {
@@ -969,6 +950,14 @@ namespace DshTray
             {
                 SetTimer(progressHwnd, (UIntPtr)2, 35, IntPtr.Zero);
             }
+            else if (notify && !progressIsCompleted && stage == null && !started)
+            {
+                // A standalone notification (no in-flight progress stage): show
+                // the window briefly, then hide it again automatically.
+                KillTimer(progressHwnd, (UIntPtr)2);
+                SetTimer(progressHwnd, (UIntPtr)1, 6000, IntPtr.Zero);
+            }
+
             InvalidateRect(progressHwnd, IntPtr.Zero, false);
             if (!progressDismissedByUser)
             {
@@ -1009,11 +998,59 @@ namespace DshTray
             if (progressHwnd != IntPtr.Zero) ShowWindow(progressHwnd, SW_SHOWNOACTIVATE);
         }
 
-        private static string TrimProgressDetail(string value)
+        private static void AppendProgressLog(string text)
         {
-            string text = value.Trim();
-            if (text.Length > 180) text = text.Substring(0, 177) + "...";
-            return text;
+            if (string.IsNullOrWhiteSpace(text)) return;
+            string line = text.Trim();
+            if (line.Length > 220) line = line.Substring(0, 217) + "...";
+            bool downloadLine = line.StartsWith("下载进度", StringComparison.Ordinal);
+            lock (progressLock)
+            {
+                if (progressLogLines.Count > 0)
+                {
+                    string last = progressLogLines[progressLogLines.Count - 1];
+                    bool lastDownload = last.StartsWith("下载进度", StringComparison.Ordinal);
+                    // Download progress is a single rolling line: keep updating it
+                    // in place instead of flooding the log with one entry per tick.
+                    if (downloadLine && lastDownload)
+                    {
+                        if (last != line) progressLogLines[progressLogLines.Count - 1] = line;
+                        return;
+                    }
+                    if (last == line) return;
+                }
+                progressLogLines.Add(line);
+                if (progressLogLines.Count > MaxProgressLogLines)
+                    progressLogLines.RemoveRange(0, progressLogLines.Count - MaxProgressLogLines);
+            }
+        }
+
+        private static void DrawLogLines(IntPtr dc, RECT rect, IntPtr font, int color)
+        {
+            const int lineHeight = 18;
+            int maxLines = Math.Max(1, (rect.Bottom - rect.Top) / lineHeight);
+
+            string[] lines;
+            lock (progressLock)
+            {
+                int start = Math.Max(0, progressLogLines.Count - maxLines);
+                int count = progressLogLines.Count - start;
+                lines = new string[count];
+                for (int i = 0; i < count; i++) lines[i] = progressLogLines[start + i];
+            }
+
+            IntPtr oldFont = SelectObject(dc, font);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, color);
+            int y = rect.Bottom - lineHeight * lines.Length;
+            for (int i = 0; i < lines.Length; i++)
+            {
+                RECT lineRect = new RECT(rect.Left, y, rect.Right, y + lineHeight);
+                DrawText(dc, lines[i], -1, ref lineRect,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+                y += lineHeight;
+            }
+            SelectObject(dc, oldFont);
         }
 
         private static void PaintProgressWindow()
@@ -1067,11 +1104,10 @@ namespace DshTray
             }
 
             RECT logTitle = new RECT(24, 92, client.Right - 24, 114);
-            DrawLabel(buffer, currentProgressPercent >= 0 ? "下载进度" : "最新日志", logTitle, bodyFont, secondary,
+            DrawLabel(buffer, "启动日志", logTitle, bodyFont, secondary,
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             RECT logRect = new RECT(24, 116, client.Right - 24, client.Bottom - 70);
-            DrawLabel(buffer, currentProgressDetail, logRect, logFont, logText,
-                DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS);
+            DrawLogLines(buffer, logRect, logFont, logText);
 
             RECT logButton = GetLogButtonRect(client);
             int logButtonColor = useDarkTheme
@@ -1207,30 +1243,6 @@ namespace DshTray
             {
             }
         }
-        private static void ShowBalloon(string title, string text, uint flags)
-        {
-            try
-            {
-                NOTIFYICONDATA nid = new NOTIFYICONDATA();
-                nid.cbSize = (uint)Marshal.SizeOf<NOTIFYICONDATA>();
-                nid.hWnd = hwnd;
-                nid.uID = 1;
-                nid.uFlags = NIF_INFO;
-                nid.szInfo = text;
-                nid.szInfoTitle = title;
-                nid.dwInfoFlags = flags;
-                nid.uTimeoutOrVersion = 5000;
-
-                lock (trayLock)
-                {
-                    Shell_NotifyIcon(NIM_MODIFY, ref nid);
-                }
-            }
-            catch
-            {
-            }
-        }
-
         private static void Cleanup()
         {
             if (progressHwnd != IntPtr.Zero)

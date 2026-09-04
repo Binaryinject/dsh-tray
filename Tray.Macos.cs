@@ -26,10 +26,13 @@ namespace DshTray
         private static NSMenuItem branchAlphaItem;
         private static NSPanel progressPanel;
         private static NSTextField progressStatus;
-        private static NSTextField progressDetail;
+        private static NSScrollView progressLogScroll;
+        private static NSTextView progressLogView;
         private static NSProgressIndicator progressBar;
         private static bool progressDismissedByUser;
         private static bool progressIsCompleted;
+        private static readonly System.Collections.Generic.List<string> progressLogLines = new System.Collections.Generic.List<string>();
+        private const int MaxProgressLogLines = 400;
 
         public static int Run(Core c)
         {
@@ -88,7 +91,7 @@ namespace DshTray
             };
             c.Notify = delegate(string title, string text)
             {
-                ShowNotification(title, text);
+                app.BeginInvokeOnMainThread(delegate { NotifyToWindow(text); });
             };
             c.StatusChanged = delegate (string status)
             {
@@ -127,7 +130,13 @@ namespace DshTray
             };
             c.SelfUpdateFailed = delegate (string reason)
             {
-                app.BeginInvokeOnMainThread(delegate { ShowNotification("DeepSeek Harness", "自动更新失败：" + reason); });
+                app.BeginInvokeOnMainThread(delegate
+                {
+                    EnsureProgressWindow();
+                    progressMenuItem.Hidden = false;
+                    AppendProgressLog("更新失败：" + (string.IsNullOrEmpty(reason) ? "未知错误" : reason));
+                    if (!progressDismissedByUser) progressPanel.OrderFrontRegardless();
+                });
             };
             c.DshVersionChanged = delegate (string version)
             {
@@ -191,7 +200,7 @@ namespace DshTray
                 progressBar.Indeterminate = true;
                 progressBar.StartAnimation(null);
                 progressStatus.StringValue = "正在下载更新…";
-                progressDetail.StringValue = "准备下载…";
+                AppendProgressLog("下载进度：准备下载…");
                 progressPanel.OrderFrontRegardless();
                 core.BeginSelfUpdateDownload(downloadUrl);
             }
@@ -218,8 +227,8 @@ namespace DshTray
                 progressBar.StartAnimation(null);
             }
             progressStatus.StringValue = "正在下载更新…";
-            progressDetail.StringValue = "下载进度：" + SelfUpdater.FormatBytes(received)
-                + (total > 0 ? " / " + SelfUpdater.FormatBytes(total) : "");
+            AppendProgressLog("下载进度：" + SelfUpdater.FormatBytes(received)
+                + (total > 0 ? " / " + SelfUpdater.FormatBytes(total) : ""));
             if (!progressDismissedByUser) progressPanel.OrderFrontRegardless();
         }
 
@@ -227,7 +236,7 @@ namespace DshTray
         {
             EnsureProgressWindow();
             progressStatus.StringValue = "已下载，正在安装并重启…";
-            progressDetail.StringValue = "即将静默安装并重新启动。";
+            AppendProgressLog("即将静默安装并重新启动。");
             progressBar.StopAnimation(null);
             progressBar.Indeterminate = false;
             progressBar.MinValue = 0;
@@ -268,7 +277,7 @@ namespace DshTray
             if (progressPanel != null) return;
 
             progressPanel = new NSPanel(
-                new CGRect(0, 0, 500, 220),
+                new CGRect(0, 0, 500, 340),
                 NSWindowStyle.Titled | NSWindowStyle.Closable,
                 NSBackingStore.Buffered,
                 false);
@@ -278,13 +287,21 @@ namespace DshTray
             progressPanel.HidesOnDeactivate = false;
             progressPanel.WillClose += delegate { progressDismissedByUser = true; };
 
-            progressStatus = CreateLabel(new CGRect(24, 164, 452, 28), "正在准备更新…", 15);
-            progressBar = new NSProgressIndicator(new CGRect(24, 136, 452, 16));
+            progressStatus = CreateLabel(new CGRect(24, 284, 452, 28), "正在准备更新…", 15);
+            progressBar = new NSProgressIndicator(new CGRect(24, 256, 452, 16));
             progressBar.Style = NSProgressIndicatorStyle.Bar;
             progressBar.Indeterminate = true;
             progressBar.StartAnimation(null);
-            progressDetail = CreateLabel(new CGRect(24, 76, 452, 48), "等待 npm 输出…", 12);
-            progressDetail.LineBreakMode = NSLineBreakMode.TruncatingTail;
+
+            progressLogScroll = new NSScrollView(new CGRect(24, 72, 452, 176));
+            progressLogScroll.HasVerticalScroller = true;
+            progressLogScroll.BorderType = NSBorderType.BezelBorder;
+            progressLogView = new NSTextView(new CGRect(0, 0, 452, 176));
+            progressLogView.Editable = false;
+            progressLogView.Selectable = true;
+            progressLogView.Font = NSFont.SystemFontOfSize(11);
+            progressLogView.DrawsBackground = false;
+            progressLogScroll.DocumentView = progressLogView;
 
             NSButton logButton = new NSButton(new CGRect(276, 24, 96, 32));
             logButton.Title = "查看日志";
@@ -302,7 +319,7 @@ namespace DshTray
 
             progressPanel.ContentView.AddSubview(progressStatus);
             progressPanel.ContentView.AddSubview(progressBar);
-            progressPanel.ContentView.AddSubview(progressDetail);
+            progressPanel.ContentView.AddSubview(progressLogScroll);
             progressPanel.ContentView.AddSubview(logButton);
             progressPanel.ContentView.AddSubview(hideButton);
             progressPanel.Center();
@@ -325,11 +342,11 @@ namespace DshTray
             EnsureProgressWindow();
             progressMenuItem.Hidden = false;
             if (!string.IsNullOrEmpty(stage)) progressStatus.StringValue = stage;
-            if (!string.IsNullOrWhiteSpace(detail)) progressDetail.StringValue = "最新日志：" + TrimProgressDetail(detail);
+            if (!string.IsNullOrWhiteSpace(detail)) AppendProgressLog(detail);
             if (!progressDismissedByUser)
             {
                 progressPanel.OrderFrontRegardless();
-                if (progressIsCompleted) ScheduleAutoHide();
+                if (progressIsCompleted) ScheduleAutoHide(1000);
             }
         }
 
@@ -346,15 +363,15 @@ namespace DshTray
             if (!progressDismissedByUser)
             {
                 progressPanel.OrderFrontRegardless();
-                ScheduleAutoHide();
+                ScheduleAutoHide(1000);
             }
         }
 
-        private static void ScheduleAutoHide()
+        private static void ScheduleAutoHide(int delayMs)
         {
             ThreadPool.QueueUserWorkItem(delegate
             {
-                Thread.Sleep(1000);
+                Thread.Sleep(delayMs);
                 NSApplication.SharedApplication.BeginInvokeOnMainThread(delegate
                 {
                     if (progressPanel == null) return;
@@ -372,34 +389,49 @@ namespace DshTray
             progressPanel.OrderFrontRegardless();
         }
 
-        private static string TrimProgressDetail(string value)
+        private static void AppendProgressLog(string text)
         {
-            string text = value.Trim();
-            return text.Length > 180 ? text.Substring(0, 177) + "..." : text;
+            if (string.IsNullOrWhiteSpace(text)) return;
+            string line = text.Trim();
+            if (line.Length > 220) line = line.Substring(0, 217) + "...";
+            bool downloadLine = line.StartsWith("下载进度", StringComparison.Ordinal);
+            if (progressLogLines.Count > 0)
+            {
+                string last = progressLogLines[progressLogLines.Count - 1];
+                bool lastDownload = last.StartsWith("下载进度", StringComparison.Ordinal);
+                // Download progress is a single rolling line: keep updating it
+                // in place instead of flooding the log with one entry per tick.
+                if (downloadLine && lastDownload)
+                {
+                    if (last != line) progressLogLines[progressLogLines.Count - 1] = line;
+                    RefreshLogView();
+                    return;
+                }
+                if (last == line) return;
+            }
+            progressLogLines.Add(line);
+            if (progressLogLines.Count > MaxProgressLogLines)
+                progressLogLines.RemoveRange(0, progressLogLines.Count - MaxProgressLogLines);
+            RefreshLogView();
         }
 
-        private static void ShowNotification(string title, string text)
+        private static void RefreshLogView()
         {
-            try
-            {
-                ProcessStartInfo psi = new ProcessStartInfo();
-                psi.FileName = "/usr/bin/osascript";
-                psi.UseShellExecute = false;
-                psi.CreateNoWindow = true;
-                psi.ArgumentList.Add("-e");
-                psi.ArgumentList.Add("display notification " + QuoteForAppleScript(text) + " with title " + QuoteForAppleScript(title));
-                Process p = Process.Start(psi);
-                if (p != null) p.Dispose();
-            }
-            catch
-            {
-            }
+            if (progressLogView == null) return;
+            progressLogView.Value = string.Join("\n", progressLogLines);
+            progressLogView.ScrollToEndOfDocument(null);
         }
 
-        private static string QuoteForAppleScript(string value)
+        private static void NotifyToWindow(string text)
         {
-            if (string.IsNullOrEmpty(value)) return "\"\"";
-            return "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+            AppendProgressLog(text);
+            EnsureProgressWindow();
+            progressMenuItem.Hidden = false;
+            if (!progressDismissedByUser)
+            {
+                progressPanel.OrderFrontRegardless();
+                if (progressIsCompleted) ScheduleAutoHide(6000);
+            }
         }
 
         private static NSImage LoadImage()

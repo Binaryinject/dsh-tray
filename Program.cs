@@ -1170,6 +1170,9 @@ namespace DshTray
             webReady = false;
             webLaunchUrl = null;
             UpdateStatus("DeepSeek Harness — 服务正在启动…");
+            Action started = UpdateProgressStarted;
+            if (started != null) started();
+            ReportUpdateProgress("服务正在启动…", null);
 
             ProcessStartInfo psi = new ProcessStartInfo();
 #if WINDOWS
@@ -1343,6 +1346,9 @@ namespace DshTray
                         else
                         {
                             NotifyUser("服务已启动并就绪。");
+                            ReportUpdateProgress("服务已就绪。", null);
+                            Action completed = UpdateProgressCompleted;
+                            if (completed != null) completed();
                         }
                         if (autoOpen) OpenBrowser();
                         UpdateStatus("DeepSeek Harness");
