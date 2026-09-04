@@ -4,7 +4,7 @@ DeepSeek Harness 的原生托盘启动器。它负责启动 DSH Web 服务、等
 
 ## 工作方式
 
-- 后台运行 `npx --yes --loglevel http @deepseek-ai/dsh@next web --port <port> --no-open`
+- 后台运行 `npx --yes --loglevel http @deepseek-ai/dsh[@分支] web --port <port> --no-open`（分支 latest / next / alpha 可选，默认 next）
 - 监听 DSH 输出的 `dsh web: http://...`，确认 Web 服务初始化完成后才打开界面
 - Windows 优先使用 Chrome 的 `chrome_proxy.exe --app-id=...` 启动已安装的 DSH PWA
 - 如果 Chrome PWA 尚未安装，则打开带 token 的 DSH 页面，并提示手动点击地址栏的“安装应用”
@@ -15,12 +15,12 @@ DeepSeek Harness 的原生托盘启动器。它负责启动 DSH Web 服务、等
 
 - Windows 系统托盘 / macOS 菜单栏
 - 启动、下载、安装和退出状态通知
-- 托盘菜单：打开界面、启动 dsh 控制台、查看日志、重启服务、退出
+- 托盘菜单：显示当前版本与 dsh 版本分支、打开界面、启动 dsh 控制台、查看日志、重启服务、退出
 - 启动时先检查更新（自绘对话框）：选择「立即更新」则先更新、服务不启动，安装重启后自动开启服务
 - 重启服务前自动关闭所有 DSH Chrome App 窗口（不触碰其它 Chrome 窗口）
 - 单实例和命名管道控制
 - NativeAOT 单文件发布，不需要安装 .NET Runtime
-- 每次启动跟随 npm `next` 通道获取 DSH 版本
+- dsh 版本分支可选（latest / next / alpha），托盘菜单一键切换，切换后自动重启服务
 
 ## 编译
 
@@ -58,6 +58,16 @@ dsh-tray --stop           请求正在运行的实例停止
 
 日志位置：Windows `%TEMP%\\dsh-tray-server.log`；macOS `/tmp/dsh-tray-server.log`。
 
+## dsh 版本分支
+
+托盘菜单可以切换 DSH 使用的 npm 分发分支：
+
+- `latest`：正式稳定版（`@deepseek-ai/dsh`）
+- `next`：最新开发版（`@deepseek-ai/dsh@next`，默认）
+- `alpha`：预览版（`@deepseek-ai/dsh@alpha`）
+
+切换后 dsh-tray 会保存选择并自动重启服务到新分支。托盘菜单会显示当前分支及其对应的具体版本号（通过 `npm view` 查询，首次查询需联网）。
+
 ## Chrome PWA（Windows）
 
 首次使用时，如果 Chrome 中还没有安装 DSH PWA：
@@ -71,7 +81,7 @@ dsh-tray --stop           请求正在运行的实例停止
 
 ## 插件和重启
 
-插件市场安装或更新插件后，通常需要重启 DSH 才能生效。请使用托盘菜单中的“重启服务”，由 dsh-tray 关闭旧 Node 进程并重新启动 `@deepseek-ai/dsh@next`。重启前 dsh-tray 会先关闭所有 DSH Chrome App 窗口（只关 DSH 的 PWA，其它 Chrome 窗口不受影响），确保重启后重新打开的是干净的界面。
+插件市场安装或更新插件后，通常需要重启 DSH 才能生效。请使用托盘菜单中的“重启服务”，由 dsh-tray 关闭旧 Node 进程并按当前选中的分支重新启动 dsh。重启前 dsh-tray 会先关闭所有 DSH Chrome App 窗口（只关 DSH 的 PWA，其它 Chrome 窗口不受影响），确保重启后重新打开的是干净的界面。
 
 需要安装/移除命令行插件时，请使用托盘菜单中的“启动 dsh 控制台”：它会在终端里打开一个 dsh CLI，可以直接运行：
 
@@ -80,7 +90,7 @@ dsh plugin --profile web add <包名>      # 安装插件
 dsh plugin --profile web remove <包名>   # 移除插件
 ```
 
-控制台里的 `dsh` 等于 `npx --yes @deepseek-ai/dsh@next`，也可以运行 `dsh --profile headless "任务"` 等其他 dsh 命令。插件管理依赖 pnpm，首次使用请先执行 `npm install -g pnpm`。
+控制台里的 `dsh` 等于 `npx --yes @deepseek-ai/dsh[@当前分支]`，也可以运行 `dsh --profile headless "任务"` 等其他 dsh 命令。插件管理依赖 pnpm，首次使用请先执行 `npm install -g pnpm`。
 
 不要在此控制台运行 `dsh web`，否则会与托盘管理的服务冲突：
 
@@ -99,7 +109,7 @@ EADDRINUSE: address already in use 127.0.0.1:3080
 
 ## 依赖
 
-运行时需要 Node.js（包含 `npx`）。DSH 使用 npm 的 `next` 通道：`@deepseek-ai/dsh@next`。首次启动可能需要下载依赖。
+运行时需要 Node.js（包含 `npx`）。DSH 使用 npm 分发分支（`latest` / `next` / `alpha`，默认 `next`），可在托盘菜单切换。首次启动可能需要下载依赖。
 
 ## License
 

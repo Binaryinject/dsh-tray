@@ -43,9 +43,14 @@ namespace DshTray
         private const int ID_EXIT = 1004;
         private const int ID_PROGRESS = 1005;
         private const int ID_CONSOLE = 1006;
+        private const int ID_BRANCH_LATEST = 2001;
+        private const int ID_BRANCH_NEXT = 2002;
+        private const int ID_BRANCH_ALPHA = 2003;
 
         private const uint MF_STRING = 0x0000;
         private const uint MF_GRAYED = 0x0001;
+        private const uint MF_CHECKED = 0x0008;
+        private const uint MF_POPUP = 0x0010;
         private const uint MF_SEPARATOR = 0x0800;
         private const uint TPM_RIGHTBUTTON = 0x0002;
         private const uint TPM_BOTTOMALIGN = 0x0020;
@@ -146,6 +151,9 @@ namespace DshTray
             c.SelfUpdateProgress = QueueUpdateProgress;
             c.SelfUpdateDownloaded = QueueUpdateDownloaded;
             c.SelfUpdateFailed = QueueUpdateFailed;
+            // The Windows menu is rebuilt on every right-click, so it reads
+            // DshVersionDisplay directly; the callback only exists for macOS.
+            c.DshVersionChanged = delegate (string version) { };
 
             // Ask about updates BEFORE starting the service: when the user
             // picks "update now", the installer flow relaunches the app and
@@ -234,6 +242,9 @@ namespace DshTray
                     ShowProgressWindow();
                 }
                 else if (id == ID_RESTART) core.RestartServer();
+                else if (id == ID_BRANCH_LATEST) core.SetDshBranch(AppSettings.LatestBranch);
+                else if (id == ID_BRANCH_NEXT) core.SetDshBranch(AppSettings.NextBranch);
+                else if (id == ID_BRANCH_ALPHA) core.SetDshBranch(AppSettings.AlphaBranch);
                 else if (id == ID_EXIT) Shutdown();
                 return IntPtr.Zero;
             }
@@ -487,6 +498,12 @@ namespace DshTray
             IntPtr menu = CreatePopupMenu();
             AppendMenu(menu, MF_STRING | MF_GRAYED, 0, currentStatus);
             AppendMenu(menu, MF_STRING | MF_GRAYED, 0, "版本 " + SelfUpdater.GetCurrentVersion());
+            AppendMenu(menu, MF_STRING | MF_GRAYED, 0, core.DshVersionDisplay);
+            IntPtr branchMenu = CreatePopupMenu();
+            AppendMenu(branchMenu, MF_STRING | (core.DshBranch == AppSettings.LatestBranch ? MF_CHECKED : 0), (uint)ID_BRANCH_LATEST, "latest（稳定）");
+            AppendMenu(branchMenu, MF_STRING | (core.DshBranch == AppSettings.NextBranch ? MF_CHECKED : 0), (uint)ID_BRANCH_NEXT, "next（最新）");
+            AppendMenu(branchMenu, MF_STRING | (core.DshBranch == AppSettings.AlphaBranch ? MF_CHECKED : 0), (uint)ID_BRANCH_ALPHA, "alpha（预览）");
+            AppendMenu(menu, MF_POPUP, (uint)branchMenu, "dsh 版本分支");
             if (hasUpdateProgress) AppendMenu(menu, MF_STRING, (uint)ID_PROGRESS, "显示更新进度");
             AppendMenu(menu, MF_SEPARATOR, 0, null);
             AppendMenu(menu, MF_STRING, (uint)ID_OPEN, "打开网页");

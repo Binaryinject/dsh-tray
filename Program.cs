@@ -252,6 +252,61 @@ namespace DshTray
         }
     }
 
+    /// <summary>Persistent user preferences (currently: the dsh dist-tag branch).</summary>
+    internal static class AppSettings
+    {
+        internal const string LatestBranch = "latest";
+        internal const string NextBranch = "next";
+        internal const string AlphaBranch = "alpha";
+
+        private static string SettingsDir
+        {
+            get
+            {
+                return Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "dsh-tray");
+            }
+        }
+
+        private static string BranchFile { get { return Path.Combine(SettingsDir, "branch.txt"); } }
+
+        internal static bool IsKnownBranch(string branch)
+        {
+            return branch == LatestBranch || branch == NextBranch || branch == AlphaBranch;
+        }
+
+        /// <summary>Read the persisted branch; defaults to "next" (historic behavior).</summary>
+        internal static string GetBranch()
+        {
+            try
+            {
+                if (File.Exists(BranchFile))
+                {
+                    string b = File.ReadAllText(BranchFile).Trim();
+                    if (IsKnownBranch(b)) return b;
+                }
+            }
+            catch
+            {
+            }
+            return NextBranch;
+        }
+
+        internal static void SetBranch(string branch)
+        {
+            if (!IsKnownBranch(branch)) return;
+            try
+            {
+                Directory.CreateDirectory(SettingsDir);
+                File.WriteAllText(BranchFile, branch);
+            }
+            catch
+            {
+            }
+        }
+    }
+
     /// <summary>Shared, platform-independent launcher logic.</summary>
     internal sealed class Core
     {
@@ -272,6 +327,11 @@ namespace DshTray
         private int portWatcherGeneration;
         private volatile bool webReady;
         private string webLaunchUrl;
+        private string dshBranch;
+        private string dshVersion; // null = querying, "" = unknown, otherwise the concrete version
+
+        /// <summary>DSH's Chrome Web Store app id, used for PWA launch on Windows and macOS.</summary>
+        private const string ChromeDshAppId = "hgiemfgfjhalibdoboikeiepnnjapnpc";
 
         /// <summary>Invoked (on a background thread) when a newer release is available: (latestTag, downloadUrl, releaseUrl).</summary>
         public Action<string, string, string> SelfUpdateAvailable;
@@ -284,6 +344,9 @@ namespace DshTray
 
         /// <summary>Invoked (on a background thread) when the update check/download fails: (reason).</summary>
         public Action<string> SelfUpdateFailed;
+
+        /// <summary>Invoked (on a background thread) once the concrete dsh version is known: (version, empty string when unknown).</summary>
+        public Action<string> DshVersionChanged;
 
         /// <summary>Invoked (on the platform UI thread) when a "stop" command is received.</summary>
         public Action OnShutdownRequest;
@@ -306,12 +369,98 @@ namespace DshTray
         public bool ShuttingDown { get { return shuttingDown; } }
         public string Url { get { return "http://127.0.0.1:" + port; } }
 
+        /// <summary>The currently selected dsh dist-tag branch (latest / next / alpha).</summary>
+        public string DshBranch { get { return dshBranch; } }
+
+        /// <summary>Human-readable "dsh &lt;version&gt; · &lt;branch&gt;" line for the tray menu.</summary>
+        public string DshVersionDisplay
+        {
+            get
+            {
+                string branch = dshBranch;
+                if (dshVersion == null) return "dsh 版本查询中… · " + branch;
+                if (dshVersion.Length == 0) return "dsh · " + branch;
+                return "dsh " + dshVersion + " · " + branch;
+            }
+        }
+
+        /// <summary>npm package spec for the selected branch; "latest" uses the bare package name.</summary>
+        private string PackageSpec
+        {
+            get { return "@deepseek-ai/dsh" + (dshBranch == AppSettings.LatestBranch ? "" : "@" + dshBranch); }
+        }
+
+        /// <summary>Switch the dsh branch, persist it, and restart the service on the new branch.</summary>
+        public void SetDshBranch(string branch)
+        {
+            if (!AppSettings.IsKnownBranch(branch) || branch == dshBranch) return;
+            dshBranch = branch;
+            dshVersion = null;
+            AppSettings.SetBranch(branch);
+            Log("[branch] switching to " + branch);
+            RestartServer();
+            QueryDshVersionAsync();
+        }
+
+        /// <summary>Resolve the concrete dsh version for the current branch via `npm view`.</summary>
+        public void QueryDshVersionAsync()
+        {
+            string branch = dshBranch;
+            Thread t = new Thread(delegate ()
+            {
+                try
+                {
+                    string version = RunNpmViewVersion(branch);
+                    dshVersion = version ?? "";
+                    Action<string> cb = DshVersionChanged;
+                    if (cb != null) cb(dshVersion);
+                }
+                catch
+                {
+                    dshVersion = "";
+                }
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        private string RunNpmViewVersion(string branch)
+        {
+            ProcessStartInfo psi = new ProcessStartInfo();
+#if WINDOWS
+            psi.FileName = "cmd.exe";
+            psi.Arguments = "/c npm view @deepseek-ai/dsh@" + branch + " version";
+#else
+            psi.FileName = "npm";
+            psi.Arguments = "view @deepseek-ai/dsh@" + branch + " version";
+#endif
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            using (Process p = Process.Start(psi))
+            {
+                if (p == null) return null;
+                string output = p.StandardOutput.ReadToEnd();
+                p.StandardError.ReadToEnd(); // drain stderr to avoid any pipe deadlock
+                if (!p.WaitForExit(30000)) return null;
+                if (p.ExitCode != 0) return null;
+                if (string.IsNullOrWhiteSpace(output)) return null;
+                string first = output.Trim();
+                int newline = first.IndexOfAny(new[] { '\r', '\n' });
+                if (newline >= 0) first = first.Substring(0, newline);
+                first = first.Trim();
+                return first.Length == 0 ? null : first;
+            }
+        }
+
         public Core(int port, bool autoOpen)
         {
             this.port = port;
             this.autoOpen = autoOpen;
             this.logPath = Path.Combine(Path.GetTempPath(), "dsh-tray-server.log");
             this.latestLogPath = Path.Combine(Path.GetTempPath(), "dsh-tray-server-latest.log");
+            this.dshBranch = AppSettings.GetBranch();
         }
 
         public void Start()
@@ -324,6 +473,7 @@ namespace DshTray
             StartServer();
             StartPortWatcher();
             StartCommandListener();
+            QueryDshVersionAsync();
         }
 
         /// <summary>
@@ -385,6 +535,9 @@ namespace DshTray
         {
             if (shuttingDown) return;
             shuttingDown = true;
+            // Close DSH Chrome App windows on exit too, matching the restart
+            // and branch-switch paths.
+            CloseDshChromeApps();
             StopServer();
         }
 
@@ -404,7 +557,13 @@ namespace DshTray
                     NotifyUser("Chrome DSH App 尚未安装，请在地址栏点击“安装应用”。");
                 }
 #else
-                Process.Start(new ProcessStartInfo("open", Url) { UseShellExecute = false });
+                // macOS: launch the installed DSH PWA via Chrome's bundle id;
+                // fall back to the default browser when it is not installed.
+                if (!TryOpenMacChromeApp())
+                {
+                    Process.Start(new ProcessStartInfo("open", Url) { UseShellExecute = false });
+                    NotifyUser("DSH App 尚未安装，请在 Chrome 地址栏点击“安装应用”。");
+                }
 #endif
             }
             catch
@@ -413,8 +572,6 @@ namespace DshTray
         }
 
 #if WINDOWS
-        private const string ChromeDshAppId = "hgiemfgfjhalibdoboikeiepnnjapnpc";
-
         private bool TryOpenChromeApp()
         {
             string profile = FindChromeAppProfile(ChromeDshAppId);
@@ -479,6 +636,49 @@ namespace DshTray
 
 #endif
 
+#if MACOS
+        private string MacChromeAppBundleId
+        {
+            get { return "com.google.Chrome.app." + ChromeDshAppId; }
+        }
+
+        private bool TryOpenMacChromeApp()
+        {
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("/usr/bin/open");
+                psi.UseShellExecute = false;
+                psi.ArgumentList.Add("-b");
+                psi.ArgumentList.Add(MacChromeAppBundleId);
+                Process p = Process.Start(psi);
+                if (p == null) return false;
+                p.WaitForExit(10000);
+                return p.ExitCode == 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private void CloseDshChromeApps()
+        {
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("/usr/bin/osascript");
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.ArgumentList.Add("-e");
+                psi.ArgumentList.Add("tell application id \"" + MacChromeAppBundleId + "\" to quit");
+                Process p = Process.Start(psi);
+                if (p != null) p.Dispose();
+            }
+            catch
+            {
+            }
+        }
+#endif
+
         public void OpenLog()
         {
             try
@@ -529,7 +729,7 @@ namespace DshTray
                 // prompt accepts `dsh plugin ...` directly (a doskey macro
                 // defined inside a batch file does NOT persist, hence PS).
                 string script =
-                    "function dsh { & npx.cmd --yes @deepseek-ai/dsh@next @args };" +
+                    "function dsh { & npx.cmd --yes " + PackageSpec + " @args };" +
                     "Write-Host '';" +
                     "Write-Host '  dsh plugin --profile web add <package>     install a plugin';" +
                     "Write-Host '  dsh plugin --profile web remove <package>  remove a plugin';" +
@@ -543,7 +743,7 @@ namespace DshTray
                     "Write-Host '';" +
                     "Write-Host '  Warming the npx cache with dsh --help ...';" +
                     "Write-Host '';" +
-                    "& npx.cmd --yes @deepseek-ai/dsh@next --help;" +
+                    "& npx.cmd --yes " + PackageSpec + " --help;" +
                     "Write-Host '';" +
                     "Write-Host '  The dsh function is ready - type dsh commands, e.g.:';" +
                     "Write-Host '    dsh plugin --profile web add <package>';" +
@@ -562,7 +762,7 @@ namespace DshTray
                     "echo 'dsh plugin --profile web add <package>  - install a plugin' && " +
                     "echo 'dsh --profile headless \"task\"           - run a one-shot task' && " +
                     "echo 'Note: the tray already runs the web service on port " + port + ".' && " +
-                    "npx --yes @deepseek-ai/dsh@next --help";
+                    "npx --yes " + PackageSpec + " --help";
                 ProcessStartInfo psi = new ProcessStartInfo("osascript");
                 psi.UseShellExecute = false;
                 psi.ArgumentList.Add("-e");
@@ -588,12 +788,10 @@ namespace DshTray
             Log("[restart] restart requested");
             UpdateStatus("DeepSeek Harness — 服务正在重启…");
 
-#if WINDOWS
             // The DSH Chrome app keeps the old server alive from the user's
             // point of view (stale websocket/banners), so close those windows
             // before tearing the service down.
             CloseDshChromeApps();
-#endif
             Log("[restart] stopping server");
             StopServer();
             KillPortOwner();
@@ -953,10 +1151,10 @@ namespace DshTray
             psi.FileName = "cmd.exe";
             // --loglevel http makes npm emit fetch/cache-miss lines even when
             // stderr is redirected, so the tray can report downloads.
-            psi.Arguments = "/c npx --yes --loglevel http @deepseek-ai/dsh@next web --port " + port + " --no-open";
+            psi.Arguments = "/c npx --yes --loglevel http " + PackageSpec + " web --port " + port + " --no-open";
 #else
             psi.FileName = "/bin/sh";
-            psi.Arguments = "-c \"npx --yes --loglevel http @deepseek-ai/dsh@next web --port " + port + " --no-open\"";
+            psi.Arguments = "-c \"npx --yes --loglevel http " + PackageSpec + " web --port " + port + " --no-open\"";
 #endif
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;

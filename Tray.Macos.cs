@@ -19,6 +19,7 @@ namespace DshTray
         private static Core core;
         private static MenuActions actions; // retained so the menu target is not GC'd
         private static NSMenuItem statusMenuItem;
+        private static NSMenuItem dshVersionMenuItem;
         private static NSMenuItem progressMenuItem;
         private static NSPanel progressPanel;
         private static NSTextField progressStatus;
@@ -50,10 +51,21 @@ namespace DshTray
             NSMenu menu = new NSMenu();
             statusMenuItem = new NSMenuItem { Title = "状态：正在启动…", Enabled = false };
             NSMenuItem versionMenuItem = new NSMenuItem { Title = "版本 " + SelfUpdater.GetCurrentVersion(), Enabled = false };
+            dshVersionMenuItem = new NSMenuItem { Title = core.DshVersionDisplay, Enabled = false };
             progressMenuItem = MakeItem("显示更新进度", "showProgress:", actions);
             progressMenuItem.Hidden = true;
             menu.AddItem(statusMenuItem);
             menu.AddItem(versionMenuItem);
+            menu.AddItem(dshVersionMenuItem);
+
+            NSMenu branchMenu = new NSMenu();
+            branchMenu.AddItem(MakeBranchItem("latest（稳定）", AppSettings.LatestBranch, 1));
+            branchMenu.AddItem(MakeBranchItem("next（最新）", AppSettings.NextBranch, 2));
+            branchMenu.AddItem(MakeBranchItem("alpha（预览）", AppSettings.AlphaBranch, 3));
+            NSMenuItem branchParent = new NSMenuItem { Title = "dsh 版本分支" };
+            branchParent.Submenu = branchMenu;
+            menu.AddItem(branchParent);
+
             menu.AddItem(progressMenuItem);
             menu.AddItem(NSMenuItem.SeparatorItem);
             menu.AddItem(MakeItem("打开网页", "openBrowser:", actions));
@@ -111,6 +123,13 @@ namespace DshTray
             {
                 app.BeginInvokeOnMainThread(delegate { ShowNotification("DeepSeek Harness", "自动更新失败：" + reason); });
             };
+            c.DshVersionChanged = delegate (string version)
+            {
+                app.BeginInvokeOnMainThread(delegate
+                {
+                    if (dshVersionMenuItem != null) dshVersionMenuItem.Title = core.DshVersionDisplay;
+                });
+            };
 
             c.Start();
             // Background update check (the Windows backend asks about updates
@@ -126,6 +145,14 @@ namespace DshTray
         {
             NSMenuItem item = new NSMenuItem(title, new Selector(action), "");
             item.Target = target;
+            return item;
+        }
+
+        private static NSMenuItem MakeBranchItem(string title, string branch, nint tag)
+        {
+            NSMenuItem item = MakeItem(title, "setBranch:", actions);
+            item.Tag = tag;
+            item.State = core.DshBranch == branch ? NSCellStateValue.On : NSCellStateValue.Off;
             return item;
         }
 
@@ -407,6 +434,17 @@ namespace DshTray
 
             [Export("restartServer:")]
             public void RestartServer(NSObject sender) { core.RestartServer(); }
+
+            [Export("setBranch:")]
+            public void SetBranch(NSObject sender)
+            {
+                NSMenuItem item = sender as NSMenuItem;
+                if (item == null) return;
+                string branch = item.Tag == 1 ? AppSettings.LatestBranch
+                    : item.Tag == 2 ? AppSettings.NextBranch
+                    : AppSettings.AlphaBranch;
+                core.SetDshBranch(branch);
+            }
 
             [Export("quit:")]
             public void Quit(NSObject sender)
