@@ -328,7 +328,9 @@ namespace DshTray
         private volatile bool webReady;
         private string webLaunchUrl;
         private string dshBranch;
-        private string dshVersion; // null = querying, "" = unknown, otherwise the concrete version
+        private string dshVersionLatest;   // null = querying, "" = unknown, otherwise concrete version
+        private string dshVersionNext;
+        private string dshVersionAlpha;
 
         /// <summary>DSH's Chrome Web Store app id, used for PWA launch on Windows and macOS.</summary>
         private const string ChromeDshAppId = "hgiemfgfjhalibdoboikeiepnnjapnpc";
@@ -378,10 +380,32 @@ namespace DshTray
             get
             {
                 string branch = dshBranch;
-                if (dshVersion == null) return "dsh 版本查询中… · " + branch;
-                if (dshVersion.Length == 0) return "dsh · " + branch;
-                return "dsh " + dshVersion + " · " + branch;
+                string v = GetDshVersion(branch);
+                if (v == null) return "dsh 版本查询中… · " + branch;
+                if (v.Length == 0) return "dsh · " + branch;
+                return "dsh " + v + " · " + branch;
             }
+        }
+
+        /// <summary>Concrete version for a branch (null = querying, "" = unknown).</summary>
+        private string GetDshVersion(string branch)
+        {
+            if (branch == AppSettings.LatestBranch) return dshVersionLatest;
+            if (branch == AppSettings.NextBranch) return dshVersionNext;
+            if (branch == AppSettings.AlphaBranch) return dshVersionAlpha;
+            return "";
+        }
+
+        /// <summary>Branch menu-item label with its version, e.g. "next（最新）· 0.1.2-rc.1".</summary>
+        public string BranchDisplayName(string branch)
+        {
+            string desc =
+                branch == AppSettings.LatestBranch ? "latest（稳定）" :
+                branch == AppSettings.NextBranch ? "next（最新）" :
+                branch == AppSettings.AlphaBranch ? "alpha（预览）" : branch;
+            string v = GetDshVersion(branch);
+            if (v == null || v.Length == 0) return desc;
+            return desc + " · " + v;
         }
 
         /// <summary>npm package spec for the selected branch; "latest" uses the bare package name.</summary>
@@ -395,30 +419,31 @@ namespace DshTray
         {
             if (!AppSettings.IsKnownBranch(branch) || branch == dshBranch) return;
             dshBranch = branch;
-            dshVersion = null;
             AppSettings.SetBranch(branch);
             Log("[branch] switching to " + branch);
             RestartServer();
             QueryDshVersionAsync();
         }
 
-        /// <summary>Resolve the concrete dsh version for the current branch via `npm view`.</summary>
+        /// <summary>Resolve the concrete dsh versions for all three branches via `npm view`.</summary>
         public void QueryDshVersionAsync()
         {
-            string branch = dshBranch;
             Thread t = new Thread(delegate ()
             {
                 try
                 {
-                    string version = RunNpmViewVersion(branch);
-                    dshVersion = version ?? "";
-                    Action<string> cb = DshVersionChanged;
-                    if (cb != null) cb(dshVersion);
+                    dshVersionLatest = RunNpmViewVersion(AppSettings.LatestBranch) ?? "";
+                    dshVersionNext = RunNpmViewVersion(AppSettings.NextBranch) ?? "";
+                    dshVersionAlpha = RunNpmViewVersion(AppSettings.AlphaBranch) ?? "";
                 }
                 catch
                 {
-                    dshVersion = "";
+                    if (dshVersionLatest == null) dshVersionLatest = "";
+                    if (dshVersionNext == null) dshVersionNext = "";
+                    if (dshVersionAlpha == null) dshVersionAlpha = "";
                 }
+                Action<string> cb = DshVersionChanged;
+                if (cb != null) cb(dshBranch);
             });
             t.IsBackground = true;
             t.Start();

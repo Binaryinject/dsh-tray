@@ -21,6 +21,9 @@ namespace DshTray
         private static NSMenuItem statusMenuItem;
         private static NSMenuItem dshVersionMenuItem;
         private static NSMenuItem progressMenuItem;
+        private static NSMenuItem branchLatestItem;
+        private static NSMenuItem branchNextItem;
+        private static NSMenuItem branchAlphaItem;
         private static NSPanel progressPanel;
         private static NSTextField progressStatus;
         private static NSTextField progressDetail;
@@ -59,9 +62,12 @@ namespace DshTray
             menu.AddItem(dshVersionMenuItem);
 
             NSMenu branchMenu = new NSMenu();
-            branchMenu.AddItem(MakeBranchItem("latest（稳定）", AppSettings.LatestBranch, 1));
-            branchMenu.AddItem(MakeBranchItem("next（最新）", AppSettings.NextBranch, 2));
-            branchMenu.AddItem(MakeBranchItem("alpha（预览）", AppSettings.AlphaBranch, 3));
+            branchLatestItem = MakeBranchItem(AppSettings.LatestBranch, 1);
+            branchNextItem = MakeBranchItem(AppSettings.NextBranch, 2);
+            branchAlphaItem = MakeBranchItem(AppSettings.AlphaBranch, 3);
+            branchMenu.AddItem(branchLatestItem);
+            branchMenu.AddItem(branchNextItem);
+            branchMenu.AddItem(branchAlphaItem);
             NSMenuItem branchParent = new NSMenuItem { Title = "dsh 版本分支" };
             branchParent.Submenu = branchMenu;
             menu.AddItem(branchParent);
@@ -125,10 +131,7 @@ namespace DshTray
             };
             c.DshVersionChanged = delegate (string version)
             {
-                app.BeginInvokeOnMainThread(delegate
-                {
-                    if (dshVersionMenuItem != null) dshVersionMenuItem.Title = core.DshVersionDisplay;
-                });
+                app.BeginInvokeOnMainThread(delegate { RefreshDshMenuTitles(); });
             };
 
             c.Start();
@@ -148,12 +151,20 @@ namespace DshTray
             return item;
         }
 
-        private static NSMenuItem MakeBranchItem(string title, string branch, nint tag)
+        private static NSMenuItem MakeBranchItem(string branch, nint tag)
         {
-            NSMenuItem item = MakeItem(title, "setBranch:", actions);
+            NSMenuItem item = MakeItem(core.BranchDisplayName(branch), "setBranch:", actions);
             item.Tag = tag;
             item.State = core.DshBranch == branch ? NSCellStateValue.On : NSCellStateValue.Off;
             return item;
+        }
+
+        private static void RefreshDshMenuTitles()
+        {
+            if (dshVersionMenuItem != null) dshVersionMenuItem.Title = core.DshVersionDisplay;
+            if (branchLatestItem != null) branchLatestItem.Title = core.BranchDisplayName(AppSettings.LatestBranch);
+            if (branchNextItem != null) branchNextItem.Title = core.BranchDisplayName(AppSettings.NextBranch);
+            if (branchAlphaItem != null) branchAlphaItem.Title = core.BranchDisplayName(AppSettings.AlphaBranch);
         }
 
         private static void Shutdown()
