@@ -418,8 +418,10 @@ namespace DshTray
         private static void RefreshLogView()
         {
             if (progressLogView == null) return;
-            progressLogView.Value = string.Join("\n", progressLogLines);
-            progressLogView.ScrollToEndOfDocument(null);
+            string text = string.Join("\n", progressLogLines);
+            progressLogView.Value = text;
+            if (text.Length > 0)
+                progressLogView.ScrollRangeToVisible(new NSRange((nint)text.Length, 0));
         }
 
         private static void NotifyToWindow(string text)
