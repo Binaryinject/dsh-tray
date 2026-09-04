@@ -42,6 +42,7 @@ namespace DshTray
         private const int ID_RESTART = 1003;
         private const int ID_EXIT = 1004;
         private const int ID_PROGRESS = 1005;
+        private const int ID_CONSOLE = 1006;
 
         private const uint MF_STRING = 0x0000;
         private const uint MF_GRAYED = 0x0001;
@@ -205,6 +206,7 @@ namespace DshTray
             {
                 int id = (int)((long)wParam & 0xffff);
                 if (id == ID_OPEN) core.OpenBrowser();
+                else if (id == ID_CONSOLE) core.OpenConsole();
                 else if (id == ID_LOG) core.OpenLog();
                 else if (id == ID_PROGRESS)
                 {
@@ -389,6 +391,7 @@ namespace DshTray
             if (hasUpdateProgress) AppendMenu(menu, MF_STRING, (uint)ID_PROGRESS, "显示更新进度");
             AppendMenu(menu, MF_SEPARATOR, 0, null);
             AppendMenu(menu, MF_STRING, (uint)ID_OPEN, "打开网页");
+            AppendMenu(menu, MF_STRING, (uint)ID_CONSOLE, "启动 dsh 控制台");
             AppendMenu(menu, MF_STRING, (uint)ID_LOG, "查看日志");
             AppendMenu(menu, MF_STRING, (uint)ID_RESTART, "重启服务器");
             AppendMenu(menu, MF_SEPARATOR, 0, null);

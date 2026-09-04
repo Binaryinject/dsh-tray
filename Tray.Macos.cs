@@ -57,6 +57,7 @@ namespace DshTray
             menu.AddItem(progressMenuItem);
             menu.AddItem(NSMenuItem.SeparatorItem);
             menu.AddItem(MakeItem("打开网页", "openBrowser:", actions));
+            menu.AddItem(MakeItem("启动 dsh 控制台", "openConsole:", actions));
             menu.AddItem(MakeItem("查看日志", "openLog:", actions));
             menu.AddItem(MakeItem("重启服务器", "restartServer:", actions));
             menu.AddItem(NSMenuItem.SeparatorItem);
@@ -391,6 +392,9 @@ namespace DshTray
 
             [Export("openBrowser:")]
             public void OpenBrowser(NSObject sender) { core.OpenBrowser(); }
+
+            [Export("openConsole:")]
+            public void OpenConsole(NSObject sender) { core.OpenConsole(); }
 
             [Export("openLog:")]
             public void OpenLog(NSObject sender) { core.OpenLog(); }

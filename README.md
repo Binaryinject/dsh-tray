@@ -15,7 +15,7 @@ DeepSeek Harness 的原生托盘启动器。它负责启动 DSH Web 服务、等
 
 - Windows 系统托盘 / macOS 菜单栏
 - 启动、下载、安装和退出状态通知
-- 托盘菜单：打开界面、查看日志、重启服务、退出
+- 托盘菜单：打开界面、启动 dsh 控制台、查看日志、重启服务、退出
 - 单实例和命名管道控制
 - NativeAOT 单文件发布，不需要安装 .NET Runtime
 - 每次启动跟随 npm `next` 通道获取 DSH 版本
@@ -69,9 +69,18 @@ dsh-tray --stop           请求正在运行的实例停止
 
 ## 插件和重启
 
-插件市场安装或更新插件后，通常需要重启 DSH 才能生效。请使用托盘菜单中的“重启服务”，由 dsh-tray 关闭旧 Node 进程并重新启动 `@deepseek-ai/dsh@next`。
+插件市场安装或更新插件后，通常需要重启 DSH 才能生效。请使用托盘菜单中的“重启服务”，由 dsh-tray 关闭旧 Node 进程并重新启动 `@deepseek-ai/dsh@next`。重启前 dsh-tray 会先关闭所有 DSH Chrome App 窗口（只关 DSH 的 PWA，其它 Chrome 窗口不受影响），确保重启后重新打开的是干净的界面。
 
-不要直接在另一个终端运行第二个 `dsh web`，否则会导致：
+需要安装/移除命令行插件时，请使用托盘菜单中的“启动 dsh 控制台”：它会在终端里打开一个 dsh CLI，可以直接运行：
+
+```text
+dsh plugin --profile web add <包名>      # 安装插件
+dsh plugin --profile web remove <包名>   # 移除插件
+```
+
+控制台里的 `dsh` 等于 `npx --yes @deepseek-ai/dsh@next`，也可以运行 `dsh --profile headless "任务"` 等其他 dsh 命令。插件管理依赖 pnpm，首次使用请先执行 `npm install -g pnpm`。
+
+不要在此控制台运行 `dsh web`，否则会与托盘管理的服务冲突：
 
 ```text
 EADDRINUSE: address already in use 127.0.0.1:3080

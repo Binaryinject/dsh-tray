@@ -502,18 +502,133 @@ namespace DshTray
             }
         }
 
+        /// <summary>
+        /// Open a fresh terminal console with the dsh CLI ready — for running
+        /// plugin installs (`dsh plugin --profile web add &lt;pkg&gt;`), one-shot
+        /// headless tasks, and other dsh commands. The tray keeps managing the
+        /// web service, so the console must not run another `dsh web`.
+        /// </summary>
+        public void OpenConsole()
+        {
+            try
+            {
+#if WINDOWS
+                // PowerShell -NoExit session with a `dsh` function in session
+                // scope: the function survives the -Command script, so the
+                // prompt accepts `dsh plugin ...` directly (a doskey macro
+                // defined inside a batch file does NOT persist, hence PS).
+                string script =
+                    "function dsh { & npx.cmd --yes @deepseek-ai/dsh@next @args };" +
+                    "Write-Host '';" +
+                    "Write-Host '  dsh plugin --profile web add <package>     install a plugin';" +
+                    "Write-Host '  dsh plugin --profile web remove <package>  remove a plugin';" +
+                    "Write-Host '  dsh --profile headless task                run a one-shot task';" +
+                    "Write-Host '';" +
+                    "Write-Host '  Note: the tray already runs dsh web on port " + port + ".';" +
+                    "Write-Host '  Use the tray menu to restart or stop that service.';" +
+                    "Write-Host '';" +
+                    "Write-Host '  First time? pnpm is required for plugin management:';" +
+                    "Write-Host '    npm install -g pnpm';" +
+                    "Write-Host '';" +
+                    "Write-Host '  Warming the npx cache with dsh --help ...';" +
+                    "Write-Host '';" +
+                    "& npx.cmd --yes @deepseek-ai/dsh@next --help;" +
+                    "Write-Host '';" +
+                    "Write-Host '  The dsh function is ready - type dsh commands, e.g.:';" +
+                    "Write-Host '    dsh plugin --profile web add <package>';" +
+                    "Write-Host '';";
+                ProcessStartInfo psi = new ProcessStartInfo("powershell.exe");
+                psi.UseShellExecute = false;
+                psi.WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                psi.ArgumentList.Add("-NoLogo");
+                psi.ArgumentList.Add("-NoExit");
+                psi.ArgumentList.Add("-Command");
+                psi.ArgumentList.Add(script);
+                Process.Start(psi);
+#else
+                string cmd =
+                    "cd ~ && " +
+                    "echo 'dsh plugin --profile web add <package>  - install a plugin' && " +
+                    "echo 'dsh --profile headless \"task\"           - run a one-shot task' && " +
+                    "echo 'Note: the tray already runs the web service on port " + port + ".' && " +
+                    "npx --yes @deepseek-ai/dsh@next --help";
+                ProcessStartInfo psi = new ProcessStartInfo("osascript");
+                psi.UseShellExecute = false;
+                psi.ArgumentList.Add("-e");
+                psi.ArgumentList.Add("tell application \"Terminal\" to do script " + AppleScriptQuote(cmd));
+                Process.Start(psi);
+#endif
+            }
+            catch
+            {
+            }
+        }
+
+        private static string AppleScriptQuote(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return "\"\"";
+            return "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+        }
+
         public void RestartServer()
         {
             if (shuttingDown) return;
 
             UpdateStatus("DeepSeek Harness — 服务正在重启…");
 
+#if WINDOWS
+            // The DSH Chrome app keeps the old server alive from the user's
+            // point of view (stale websocket/banners), so close those windows
+            // before tearing the service down.
+            CloseDshChromeApps();
+#endif
             StopServer();
             KillPortOwner();
             WaitForPortClosed(5000);
             StartServer();
             StartPortWatcher();
         }
+
+#if WINDOWS
+        /// <summary>
+        /// Close every Chrome window that belongs to the DSH app (all other
+        /// Chrome windows stay untouched). Matches chrome.exe browser
+        /// processes, one per instance, whose command line carries either the
+        /// installed DSH app id (PWA launched via chrome_proxy --app-id) or a
+        /// URL on this tray's port --set by "open web page". Regular Chrome
+        /// instances (no URL on the command line) never match.
+        /// </summary>
+        private void CloseDshChromeApps()
+        {
+            try
+            {
+                // Only browser processes (no --type=): killing the browser
+                // process tree closes that instance's windows cleanly.
+                string ps =
+                    "$ids = Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | " +
+                    "Where-Object { $_.CommandLine -notmatch '--type=' -and (" +
+                    "$_.CommandLine -match '--app-id=" + ChromeDshAppId + "' -or " +
+                    "$_.CommandLine -match '127\\.0\\.0\\.1:" + port + "' -or " +
+                    "$_.CommandLine -match 'localhost:" + port + "') } | " +
+                    "ForEach-Object { $_.ProcessId }; " +
+                    "foreach ($id in $ids) { & taskkill /PID $id /T /F 2>$null | Out-Null }";
+
+                ProcessStartInfo psi = new ProcessStartInfo("powershell.exe");
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.ArgumentList.Add("-NoProfile");
+                psi.ArgumentList.Add("-WindowStyle");
+                psi.ArgumentList.Add("Hidden");
+                psi.ArgumentList.Add("-Command");
+                psi.ArgumentList.Add(ps);
+                Process p = Process.Start(psi);
+                if (p != null) p.WaitForExit(15000);
+            }
+            catch
+            {
+            }
+        }
+#endif
 
         private void StartServer()
         {
