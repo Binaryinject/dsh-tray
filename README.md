@@ -14,6 +14,7 @@ DeepSeek Harness 的原生托盘启动器。它负责启动 DSH Web 服务、等
 ## 功能
 
 - Windows 系统托盘 / macOS 菜单栏
+- 托盘菜单（Windows）为自绘皮肤：与更新/创建对话框一致的深浅主题、圆角与高亮样式，不随系统菜单外观变化
 - 启动、下载、安装和退出状态通知
 - 托盘菜单：显示当前版本与 dsh 版本分支、打开界面、启动 dsh 控制台、查看日志、重启服务、退出
 - 启动时先检查更新（自绘对话框）：选择「立即更新」则先更新、服务不启动，安装重启后自动开启服务
@@ -21,6 +22,7 @@ DeepSeek Harness 的原生托盘启动器。它负责启动 DSH Web 服务、等
 - 单实例和命名管道控制
 - NativeAOT 单文件发布，不需要安装 .NET Runtime
 - dsh 版本分支可选（latest / next / alpha），托盘菜单一键切换，切换后自动重启服务
+- dsh Profile 可切换、可创建（web 型，含基础组合包与网页外壳），切换后自动重启服务
 
 ## 编译
 
@@ -67,6 +69,16 @@ dsh-tray --stop           请求正在运行的实例停止
 - `alpha`：预览版（`@deepseek-ai/dsh@alpha`）
 
 切换后 dsh-tray 会保存选择并自动重启服务到新分支。托盘菜单会显示当前分支及其对应的具体版本号（通过 `npm view` 查询，首次查询需联网）。
+
+## DSH Profile
+
+托盘菜单的 `Profile` 子菜单可以切换 dsh 使用的 profile（`$DSH_HOME/profiles/<名称>`，默认 `web`）：
+
+- 菜单会列出所有已存在的 profile 目录（带 `package.json`），勾选当前使用的那个
+- 点击「创建 Profile…」输入名称后，dsh-tray 会在 `$DSH_HOME/profiles/` 下创建新的 web 型 profile（dsh-base + dsh-web-app，实时应用 patch），并自动切换、重启服务
+- 名称仅允许字母、数字、`-`、`_`、`.` 且以字母或数字开头；`desktop` 与 `node_modules` 为保留名
+- 切换 Profile 后托盘会保存选择，之后启动的 dsh 服务都使用该 profile；控制台里的 `dsh plugin --profile ...` 提示也会跟随当前 profile
+- 新 profile 为空配置，如需安装插件，使用控制台中的 `dsh plugin --profile <名称> add <包名>`（依赖 pnpm）
 
 ## Chrome PWA（Windows）
 

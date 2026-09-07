@@ -3,11 +3,14 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
+using System.Linq;
 using System.Net.Sockets;
 using System.Net.Http;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Threading;
 
 namespace DshTray
@@ -305,6 +308,63 @@ namespace DshTray
             {
             }
         }
+
+        private static string ProfileFile { get { return Path.Combine(SettingsDir, "profile.txt"); } }
+
+        internal const string DefaultProfile = "web";
+
+        /// <summary>
+        /// Profile-name validation aligned with dsh's resolver (rejects "/",
+        /// "\", ".", "..", the reserved node_modules/desktop names) plus a strict
+        /// ASCII charset starting with a letter or digit — the name is embedded
+        /// in a shell command line, so no shell metacharacters are allowed.
+        /// </summary>
+        internal static bool IsValidProfileName(string name)
+        {
+            if (string.IsNullOrEmpty(name) || name.Length > 64) return false;
+            char first = name[0];
+            if (!char.IsAsciiLetterOrDigit(first)) return false;
+            for (int i = 0; i < name.Length; i++)
+            {
+                char c = name[i];
+                if (!char.IsAsciiLetterOrDigit(c) && c != '-' && c != '_' && c != '.') return false;
+            }
+            if (name.IndexOf('/') >= 0 || name.IndexOf('\\') >= 0) return false;
+            if (name == "." || name == "..") return false;
+            if (string.Equals(name, "node_modules", StringComparison.OrdinalIgnoreCase)) return false;
+            if (string.Equals(name, "desktop", StringComparison.OrdinalIgnoreCase)) return false;
+            return true;
+        }
+
+        /// <summary>Read the persisted profile; defaults to the built-in "web".</summary>
+        internal static string GetProfile()
+        {
+            try
+            {
+                if (File.Exists(ProfileFile))
+                {
+                    string p = File.ReadAllText(ProfileFile).Trim();
+                    if (IsValidProfileName(p)) return p;
+                }
+            }
+            catch
+            {
+            }
+            return DefaultProfile;
+        }
+
+        internal static void SetProfile(string profile)
+        {
+            if (!IsValidProfileName(profile)) return;
+            try
+            {
+                Directory.CreateDirectory(SettingsDir);
+                File.WriteAllText(ProfileFile, profile);
+            }
+            catch
+            {
+            }
+        }
     }
 
     /// <summary>Shared, platform-independent launcher logic.</summary>
@@ -328,6 +388,7 @@ namespace DshTray
         private volatile bool webReady;
         private string webLaunchUrl;
         private string dshBranch;
+        private string dshProfile;
         private string dshVersionLatest;   // null = querying, "" = unknown, otherwise concrete version
         private string dshVersionNext;
         private string dshVersionAlpha;
@@ -373,6 +434,143 @@ namespace DshTray
 
         /// <summary>The currently selected dsh dist-tag branch (latest / next / alpha).</summary>
         public string DshBranch { get { return dshBranch; } }
+
+        /// <summary>The currently selected dsh profile (web or a custom one).</summary>
+        public string DshProfile { get { return dshProfile; } }
+
+        /// <summary>Absolute path of $DSH_HOME/profiles (DSH_HOME defaults to ~/.dsh).</summary>
+        internal static string ProfilesDirectory
+        {
+            get
+            {
+                string root = Environment.GetEnvironmentVariable("DSH_HOME");
+                if (string.IsNullOrWhiteSpace(root))
+                    root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh");
+                else
+                    root = root.Trim();
+                return Path.Combine(root, "profiles");
+            }
+        }
+
+        /// <summary>Absolute path of a single profile's directory.</summary>
+        private static string ProfileDirectory(string name)
+        {
+            return Path.Combine(ProfilesDirectory, name);
+        }
+
+        /// <summary>
+        /// All present, switchable profiles: names of profile directories that
+        /// carry a package.json, excluding reserved names (node_modules,
+        /// desktop). Sorted ordinally.
+        /// </summary>
+        public List<string> GetAvailableProfiles()
+        {
+            List<string> result = new List<string>();
+            try
+            {
+                string root = ProfilesDirectory;
+                if (!Directory.Exists(root)) return result;
+                foreach (string dir in Directory.GetDirectories(root))
+                {
+                    string name = Path.GetFileName(dir);
+                    if (!AppSettings.IsValidProfileName(name)) continue;
+                    if (!File.Exists(Path.Combine(dir, "package.json"))) continue;
+                    result.Add(name);
+                }
+            }
+            catch
+            {
+            }
+            result.Sort(StringComparer.Ordinal);
+            return result;
+        }
+
+        /// <summary>
+        /// Switch the dsh profile, persist the choice, and restart the service
+        /// on the new profile. Matches the branch-switch behavior.
+        /// </summary>
+        public void SetDshProfile(string profile)
+        {
+            if (!AppSettings.IsValidProfileName(profile) || profile == dshProfile) return;
+            dshProfile = profile;
+            AppSettings.SetProfile(profile);
+            Log("[profile] switching to " + profile);
+            RestartServer();
+        }
+
+        /// <summary>
+        /// Create a web-style profile (dsh-base + dsh-web-app bundles, live
+        /// patch reload) under $DSH_HOME/profiles/&lt;name&gt;. The written
+        /// files mirror what `dsh plugin` init would create — manifest, empty
+        /// user patch layer, pnpm workspace — so plugin management and future
+        /// boots work without pnpm being installed first. Returns false with an
+        /// error message on failure.
+        /// </summary>
+        public bool CreateProfile(string name, out string error)
+        {
+            error = null;
+            if (!AppSettings.IsValidProfileName(name))
+            {
+                error = "名称无效：仅允许字母、数字、-、_、.，且以字母或数字开头（desktop 与 node_modules 为保留名）。";
+                return false;
+            }
+            try
+            {
+                string dir = ProfileDirectory(name);
+                Directory.CreateDirectory(dir);
+
+                string manifest = Path.Combine(dir, "package.json");
+                if (!File.Exists(manifest))
+                {
+                    // Literal JSON (same shape `dsh plugin` init writes): name
+                    // is charset-validated, so no escaping is needed.
+                    string manifestJson =
+                        "{\n" +
+                        "  \"name\": \"dsh-profile-" + name + "\",\n" +
+                        "  \"private\": true,\n" +
+                        "  \"dependencies\": {},\n" +
+                        "  \"dsh\": {\n" +
+                        "    \"profile\": {\n" +
+                        "      \"bundles\": [\n" +
+                        "        \"@deepseek-ai/dsh-base\",\n" +
+                        "        \"@deepseek-ai/dsh-web-app\"\n" +
+                        "      ],\n" +
+                        "      \"patchReload\": \"live\"\n" +
+                        "    }\n" +
+                        "  }\n" +
+                        "}\n";
+                    File.WriteAllText(manifest, manifestJson, new UTF8Encoding(false));
+                }
+
+                string patchFile = Path.Combine(dir, "cordis.patch.yml");
+                if (!File.Exists(patchFile))
+                {
+                    File.WriteAllText(patchFile,
+                        "# Your patch layer for this dsh profile, applied after every bundle layer:\n" +
+                        "# a top-level YAML array of loader patch entries (id-targeted config\n" +
+                        "# overrides, disables, and insert lists; `!!js` expressions allowed).\n" +
+                        "[]\n",
+                        new UTF8Encoding(false));
+                }
+
+                string workspaceFile = Path.Combine(dir, "pnpm-workspace.yaml");
+                if (!File.Exists(workspaceFile))
+                {
+                    File.WriteAllText(workspaceFile,
+                        "packages:\n" +
+                        "  - .\n\n" +
+                        "nodeLinker: hoisted\n" +
+                        "autoInstallPeers: false\n",
+                        new UTF8Encoding(false));
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
 
         /// <summary>Human-readable "dsh &lt;version&gt; · &lt;branch&gt;" line for the tray menu.</summary>
         public string DshVersionDisplay
@@ -486,6 +684,15 @@ namespace DshTray
             this.logPath = Path.Combine(Path.GetTempPath(), "dsh-tray-server.log");
             this.latestLogPath = Path.Combine(Path.GetTempPath(), "dsh-tray-server-latest.log");
             this.dshBranch = AppSettings.GetBranch();
+            this.dshProfile = AppSettings.GetProfile();
+            // A saved profile may have been removed by hand; fall back to the
+            // built-in web profile (dsh re-initializes it from its template).
+            if (!Directory.Exists(ProfileDirectory(dshProfile)))
+            {
+                Log("[profile] saved profile '" + dshProfile + "' is missing; falling back to " + AppSettings.DefaultProfile);
+                dshProfile = AppSettings.DefaultProfile;
+                AppSettings.SetProfile(dshProfile);
+            }
         }
 
         public void Start()
@@ -756,8 +963,8 @@ namespace DshTray
                 string script =
                     "function dsh { & npx.cmd --yes " + PackageSpec + " @args };" +
                     "Write-Host '';" +
-                    "Write-Host '  dsh plugin --profile web add <package>     install a plugin';" +
-                    "Write-Host '  dsh plugin --profile web remove <package>  remove a plugin';" +
+                    "Write-Host '  dsh plugin --profile " + dshProfile + " add <package>     install a plugin';" +
+                    "Write-Host '  dsh plugin --profile " + dshProfile + " remove <package>  remove a plugin';" +
                     "Write-Host '  dsh --profile headless task                run a one-shot task';" +
                     "Write-Host '';" +
                     "Write-Host '  Note: the tray already runs dsh web on port " + port + ".';" +
@@ -784,7 +991,7 @@ namespace DshTray
 #else
                 string cmd =
                     "cd ~ && " +
-                    "echo 'dsh plugin --profile web add <package>  - install a plugin' && " +
+                    "echo 'dsh plugin --profile " + dshProfile + " add <package>  - install a plugin' && " +
                     "echo 'dsh --profile headless \"task\"           - run a one-shot task' && " +
                     "echo 'Note: the tray already runs the web service on port " + port + ".' && " +
                     "npx --yes " + PackageSpec + " --help";
@@ -1179,10 +1386,12 @@ namespace DshTray
             psi.FileName = "cmd.exe";
             // --loglevel http makes npm emit fetch/cache-miss lines even when
             // stderr is redirected, so the tray can report downloads.
-            psi.Arguments = "/c npx --yes --loglevel http " + PackageSpec + " web --port " + port + " --no-open";
+            // `--profile <name>` is the launcher flag; --port/--no-open belong
+            // to the web app and are handed over verbatim.
+            psi.Arguments = "/c npx --yes --loglevel http " + PackageSpec + " --profile " + dshProfile + " --port " + port + " --no-open";
 #else
             psi.FileName = "/bin/sh";
-            psi.Arguments = "-c \"npx --yes --loglevel http " + PackageSpec + " web --port " + port + " --no-open\"";
+            psi.Arguments = "-c \"npx --yes --loglevel http " + PackageSpec + " --profile " + dshProfile + " --port " + port + " --no-open\"";
 #endif
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;
@@ -1211,6 +1420,9 @@ namespace DshTray
                 logWriter = null;
             }
 
+            RepairProfileManifestEncoding();
+            RepairMissingProfileLinks();
+
             server.OutputDataReceived += delegate (object s, DataReceivedEventArgs e) { Log(e.Data); };
             server.ErrorDataReceived += delegate (object s, DataReceivedEventArgs e) { Log(e.Data); };
 
@@ -1220,6 +1432,114 @@ namespace DshTray
             server.StandardInput.Close();
             server.BeginOutputReadLine();
             server.BeginErrorReadLine();
+        }
+
+        /// <summary>
+        /// Node's JSON.parse rejects a UTF-8 BOM, while profile package.json
+        /// files may be written with one by Windows editors or sync tools.
+        /// Remove it before dsh reads the profile manifest so startup is
+        /// self-healing and does not require a manual profile reset.
+        /// </summary>
+        private void RepairProfileManifestEncoding()
+        {
+            try
+            {
+                string manifest = Path.Combine(ProfilesDirectory, dshProfile, "package.json");
+                if (!File.Exists(manifest)) return;
+
+                byte[] bytes = File.ReadAllBytes(manifest);
+                if (bytes.Length < 3 || bytes[0] != 0xEF || bytes[1] != 0xBB || bytes[2] != 0xBF) return;
+
+                byte[] withoutBom = new byte[bytes.Length - 3];
+                Buffer.BlockCopy(bytes, 3, withoutBom, 0, withoutBom.Length);
+                File.WriteAllBytes(manifest, withoutBom);
+                Log("[profile] removed UTF-8 BOM from package.json");
+            }
+            catch (Exception ex)
+            {
+                Log("[profile] unable to repair package.json encoding: " + ex.Message);
+            }
+        }
+
+        /// <summary>Restore a published dependency when a stale local link prevents profile boot.</summary>
+        private void RepairMissingProfileLinks()
+        {
+            string profileDir = Path.Combine(ProfilesDirectory, dshProfile);
+            string manifest = Path.Combine(profileDir, "package.json");
+            if (!File.Exists(manifest)) return;
+
+            try
+            {
+                JsonNode root = JsonNode.Parse(File.ReadAllText(manifest));
+                JsonObject dependencies = root?["dependencies"] as JsonObject;
+                if (dependencies == null) return;
+
+                bool changed = false;
+                foreach (KeyValuePair<string, JsonNode> entry in dependencies.ToList())
+                {
+                    string spec = entry.Value?.GetValue<string>();
+                    if (string.IsNullOrEmpty(spec) || !spec.StartsWith("link:", StringComparison.OrdinalIgnoreCase)) continue;
+
+                    string target = spec.Substring("link:".Length).Trim();
+                    if (Directory.Exists(target) || File.Exists(Path.Combine(target, "package.json"))) continue;
+
+                    if (string.Equals(entry.Key, "dsh-review-checkout", StringComparison.Ordinal))
+                    {
+                        dependencies[entry.Key] = "0.6.0";
+                        RemoveStaleProfileLink(Path.Combine(profileDir, "node_modules", entry.Key));
+                        changed = true;
+                        Log("[profile] repaired missing local link for dsh-review-checkout; using registry version 0.6.0");
+                    }
+                }
+
+                if (!changed) return;
+                File.WriteAllText(manifest, root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) + Environment.NewLine, new UTF8Encoding(false));
+                InstallProfileDependencies(profileDir);
+            }
+            catch (Exception ex)
+            {
+                Log("[profile] unable to repair missing dependency links: " + ex.Message);
+            }
+        }
+
+        private void RemoveStaleProfileLink(string path)
+        {
+            try
+            {
+                FileAttributes attributes = File.GetAttributes(path);
+                if ((attributes & FileAttributes.ReparsePoint) != 0)
+                    Directory.Delete(path, false);
+            }
+            catch
+            {
+            }
+        }
+
+        private void InstallProfileDependencies(string profileDir)
+        {
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("cmd.exe", "/c pnpm install --reporter=silent")
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WorkingDirectory = profileDir,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+                using (Process install = Process.Start(psi))
+                {
+                    if (install == null) return;
+                    install.StandardOutput.ReadToEnd();
+                    string error = install.StandardError.ReadToEnd();
+                    if (!install.WaitForExit(120000) || install.ExitCode != 0)
+                        Log("[profile] dependency reinstall failed: " + error.Trim());
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("[profile] unable to reinstall dependencies: " + ex.Message);
+            }
         }
 
         private void Log(string line)

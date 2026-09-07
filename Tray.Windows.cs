@@ -15,18 +15,23 @@ namespace DshTray
     {
         private const uint WM_NULL = 0x0000;
         private const uint WM_DESTROY = 0x0002;
+        private const uint WM_ACTIVATE = 0x0006;
         private const uint WM_PAINT = 0x000F;
         private const uint WM_CLOSE = 0x0010;
         private const uint WM_ERASEBKGND = 0x0014;
         private const uint WM_SETTINGCHANGE = 0x001A;
         private const uint WM_COMMAND = 0x0111;
+        private const uint WM_CTLCOLOREDIT = 0x0133;
+        private const uint WM_KEYDOWN = 0x0100;
         private const uint WM_TIMER = 0x0113;
         private const uint WM_MOUSEMOVE = 0x0200;
         private const uint WM_LBUTTONDOWN = 0x0201;
         private const uint WM_LBUTTONUP = 0x0202;
         private const uint WM_MOUSELEAVE = 0x02A3;
         private const uint WM_LBUTTONDBLCLK = 0x0203;
+        private const uint WM_RBUTTONDOWN = 0x0204;
         private const uint WM_RBUTTONUP = 0x0205;
+        private const uint WM_CAPTURECHANGED = 0x0215;
         private const uint WM_TRAYICON = 0x0401;
         private const uint WM_APP_EXIT = 0x8001;
         private const uint WM_APP_STATUS = 0x8003;
@@ -45,6 +50,8 @@ namespace DshTray
         private const int ID_BRANCH_LATEST = 2001;
         private const int ID_BRANCH_NEXT = 2002;
         private const int ID_BRANCH_ALPHA = 2003;
+        private const int ID_PROFILE_FIRST = 3001;
+        private const int ID_PROFILE_CREATE = 3999;
 
         private const uint MF_STRING = 0x0000;
         private const uint MF_GRAYED = 0x0001;
@@ -69,6 +76,7 @@ namespace DshTray
         private const int WS_EX_TOOLWINDOW = 0x00000080;
         private const int WS_CAPTION = 0x00C00000;
         private const int WS_SYSMENU = 0x00080000;
+        private const int WS_POPUP = unchecked((int)0x80000000);
         private const int SW_HIDE = 0;
         private const int SW_SHOW = 5;
         private const int SW_SHOWNOACTIVATE = 4;
@@ -79,11 +87,13 @@ namespace DshTray
         private const int TRANSPARENT = 1;
         private const int NULL_PEN = 8;
         private const uint DT_LEFT = 0x0000;
+        private const uint DT_RIGHT = 0x0002;
         private const uint DT_VCENTER = 0x0004;
         private const uint DT_WORDBREAK = 0x0010;
         private const uint DT_SINGLELINE = 0x0020;
         private const uint DT_NOPREFIX = 0x0800;
         private const uint DT_END_ELLIPSIS = 0x8000;
+        private const uint DT_CALCRECT = 0x0400;
         private const uint SRCCOPY = 0x00CC0020;
 
         private const string ClassName = "DshTrayWindow";
@@ -93,6 +103,8 @@ namespace DshTray
         private static IntPtr hwnd;
         private static IntPtr progressHwnd;
         private static IntPtr updatePromptHwnd;
+        private static IntPtr menuMainHwnd;
+        private static IntPtr menuSubHwnd;
         private static IntPtr hIcon;
         private static IntPtr headingFont;
         private static IntPtr bodyFont;
@@ -107,6 +119,46 @@ namespace DshTray
         private static int updatePromptResult = -1;
         private static int hoveredPromptButton;
         private static int pressedPromptButton;
+        private static IntPtr createProfileHwnd;
+        private static IntPtr createProfileEditHwnd;
+        private static int createProfileResult = -1;
+        private static int hoveredCreateButton;
+        private static int pressedCreateButton;
+        private static string createProfileError;
+        private static IntPtr createEditBrush;
+        private static readonly List<string> menuProfiles = new List<string>();
+        private const string CreateProfileErrorText = "名称无效：仅允许字母、数字、-、_、.，\n且以字母或数字开头。";
+
+        // ---- Skinned popup menu state ----
+        private sealed class MenuItemData
+        {
+            public string Text;
+            public bool Enabled = true;
+            public bool Checked;
+            public bool IsSeparator;
+            public bool HasSubmenu;
+            public List<MenuItemData> Submenu;
+            public int CommandId;
+        }
+
+        private static readonly List<MenuItemData> menuItems = new List<MenuItemData>();
+        private static readonly List<MenuItemData> subMenuItems = new List<MenuItemData>();
+        private static readonly List<int> menuItemTops = new List<int>();
+        private static readonly List<int> menuItemHeights = new List<int>();
+        private static readonly List<int> subItemTops = new List<int>();
+        private static readonly List<int> subItemHeights = new List<int>();
+        private static int menuContentWidth;
+        private static int subMenuContentWidth;
+        private static bool menuOpen;
+        private static bool subMenuOpen;
+        private static int menuHoverIndex = -1;
+        private static int subMenuHoverIndex = -1;
+        private static int openedSubmenuIndex = -1;
+        private static int pendingMenuCommand;
+        private static IntPtr menuFont;
+        private const int MenuItemHeight = 32;
+        private const int MenuSeparatorHeight = 10;
+        private const int MenuPadding = 8;
         private static bool useDarkTheme;
         private static readonly object trayLock = new object();
         private static readonly object statusLock = new object();
@@ -225,6 +277,11 @@ namespace DshTray
                 return IntPtr.Zero;
             }
 
+            if (hWnd == menuMainHwnd || hWnd == menuSubHwnd)
+            {
+                return MenuWndProc(hWnd, msg, wParam, lParam);
+            }
+
             if (msg == WM_COMMAND)
             {
                 int id = (int)((long)wParam & 0xffff);
@@ -240,6 +297,9 @@ namespace DshTray
                 else if (id == ID_BRANCH_LATEST) core.SetDshBranch(AppSettings.LatestBranch);
                 else if (id == ID_BRANCH_NEXT) core.SetDshBranch(AppSettings.NextBranch);
                 else if (id == ID_BRANCH_ALPHA) core.SetDshBranch(AppSettings.AlphaBranch);
+                else if (id >= ID_PROFILE_FIRST && id < ID_PROFILE_FIRST + menuProfiles.Count)
+                    core.SetDshProfile(menuProfiles[id - ID_PROFILE_FIRST]);
+                else if (id == ID_PROFILE_CREATE) CreateProfileFromDialog();
                 else if (id == ID_EXIT) Shutdown();
                 return IntPtr.Zero;
             }
@@ -365,6 +425,102 @@ namespace DshTray
                 return IntPtr.Zero;
             }
 
+            if (hWnd == createProfileHwnd && msg == WM_CLOSE)
+            {
+                createProfileResult = 1;
+                ShowWindow(createProfileHwnd, SW_HIDE);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == createProfileHwnd && msg == WM_LBUTTONUP)
+            {
+                int x = (short)((long)lParam & 0xffff);
+                int y = (short)(((long)lParam >> 16) & 0xffff);
+                int button = GetCreateButtonAt(x, y);
+                int clicked = pressedCreateButton == button ? button : 0;
+                pressedCreateButton = 0;
+                ReleaseCapture();
+                InvalidateRect(createProfileHwnd, IntPtr.Zero, false);
+                if (clicked == 1)
+                {
+                    string name = ReadCreateProfileInput();
+                    if (!AppSettings.IsValidProfileName(name))
+                    {
+                        // Stay open and explain why the name was rejected.
+                        createProfileError = CreateProfileErrorText;
+                        InvalidateRect(createProfileHwnd, IntPtr.Zero, false);
+                        return IntPtr.Zero;
+                    }
+                    createProfileResult = 0;
+                }
+                else if (clicked == 2) createProfileResult = 1;
+                if (createProfileResult != -1)
+                {
+                    ShowWindow(createProfileHwnd, SW_HIDE);
+                    PostMessage(hwnd, WM_NULL, IntPtr.Zero, IntPtr.Zero);
+                }
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == createProfileHwnd && msg == WM_LBUTTONDOWN)
+            {
+                int x = (short)((long)lParam & 0xffff);
+                int y = (short)(((long)lParam >> 16) & 0xffff);
+                pressedCreateButton = GetCreateButtonAt(x, y);
+                if (pressedCreateButton != 0) SetCapture(createProfileHwnd);
+                InvalidateRect(createProfileHwnd, IntPtr.Zero, false);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == createProfileHwnd && msg == WM_MOUSEMOVE)
+            {
+                int x = (short)((long)lParam & 0xffff);
+                int y = (short)(((long)lParam >> 16) & 0xffff);
+                int button = GetCreateButtonAt(x, y);
+                if (button != hoveredCreateButton)
+                {
+                    hoveredCreateButton = button;
+                    InvalidateRect(createProfileHwnd, IntPtr.Zero, false);
+                }
+                if (button != 0) SetCursor(LoadCursor(IntPtr.Zero, (IntPtr)IDC_HAND));
+                TRACKMOUSEEVENT tracking = new TRACKMOUSEEVENT();
+                tracking.cbSize = (uint)Marshal.SizeOf<TRACKMOUSEEVENT>();
+                tracking.dwFlags = TME_LEAVE;
+                tracking.hwndTrack = createProfileHwnd;
+                TrackMouseEvent(ref tracking);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == createProfileHwnd && msg == WM_MOUSELEAVE)
+            {
+                hoveredCreateButton = 0;
+                if (pressedCreateButton == 0) InvalidateRect(createProfileHwnd, IntPtr.Zero, false);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == createProfileHwnd && msg == WM_PAINT)
+            {
+                PaintCreateProfileDialog();
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == createProfileHwnd && msg == WM_ERASEBKGND) return (IntPtr)1;
+
+            if (hWnd == createProfileHwnd && msg == WM_SETTINGCHANGE)
+            {
+                RefreshSystemTheme();
+                DestroyCreateEditBrush();
+                InvalidateRect(createProfileHwnd, IntPtr.Zero, false);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == createProfileHwnd && msg == WM_CTLCOLOREDIT)
+            {
+                SetTextColor(wParam, useDarkTheme ? Rgb(242, 244, 246) : Rgb(24, 29, 35));
+                SetBkColor(wParam, (uint)(useDarkTheme ? Rgb(45, 49, 54) : Rgb(255, 255, 255)));
+                return EnsureCreateEditBrush();
+            }
+
             if (hWnd == progressHwnd && msg == WM_CLOSE)
             {
                 progressDismissedByUser = true;
@@ -484,30 +640,403 @@ namespace DshTray
 
         private static void ShowMenu()
         {
-            IntPtr menu = CreatePopupMenu();
-            AppendMenu(menu, MF_STRING | MF_GRAYED, 0, currentStatus);
-            AppendMenu(menu, MF_STRING | MF_GRAYED, 0, "版本 " + SelfUpdater.GetCurrentVersion());
-            AppendMenu(menu, MF_STRING | MF_GRAYED, 0, core.DshVersionDisplay);
-            IntPtr branchMenu = CreatePopupMenu();
-            AppendMenu(branchMenu, MF_STRING | (core.DshBranch == AppSettings.LatestBranch ? MF_CHECKED : 0), (uint)ID_BRANCH_LATEST, core.BranchDisplayName(AppSettings.LatestBranch));
-            AppendMenu(branchMenu, MF_STRING | (core.DshBranch == AppSettings.NextBranch ? MF_CHECKED : 0), (uint)ID_BRANCH_NEXT, core.BranchDisplayName(AppSettings.NextBranch));
-            AppendMenu(branchMenu, MF_STRING | (core.DshBranch == AppSettings.AlphaBranch ? MF_CHECKED : 0), (uint)ID_BRANCH_ALPHA, core.BranchDisplayName(AppSettings.AlphaBranch));
-            AppendMenu(menu, MF_POPUP, (uint)branchMenu, "dsh 版本分支");
-            if (hasUpdateProgress) AppendMenu(menu, MF_STRING, (uint)ID_PROGRESS, "显示更新进度");
-            AppendMenu(menu, MF_SEPARATOR, 0, null);
-            AppendMenu(menu, MF_STRING, (uint)ID_OPEN, "打开网页");
-            AppendMenu(menu, MF_STRING, (uint)ID_CONSOLE, "启动 dsh 控制台");
-            AppendMenu(menu, MF_STRING, (uint)ID_LOG, "查看日志");
-            AppendMenu(menu, MF_STRING, (uint)ID_RESTART, "重启服务器");
-            AppendMenu(menu, MF_SEPARATOR, 0, null);
-            AppendMenu(menu, MF_STRING, (uint)ID_EXIT, "退出并停止服务");
+            if (menuOpen) return;
+            RefreshSystemTheme();
 
-            SetForegroundWindow(hwnd);
+            BuildMenuItems();
+
+            if (menuMainHwnd == IntPtr.Zero) EnsureMenuWindows();
+            if (menuMainHwnd == IntPtr.Zero) return;
+
+            // Measure the main menu.
+            int width = MeasureMenu(menuItems, menuItemTops, menuItemHeights, true, ref menuContentWidth);
+            int height = MenuPadding * 2 + (menuItemTops.Count > 0 ? menuItemTops[menuItemTops.Count - 1] + menuItemHeights[menuItemHeights.Count - 1] : 0);
+            int screenW = GetSystemMetrics(SM_CXSCREEN);
+            int screenH = GetSystemMetrics(SM_CYSCREEN);
             POINT pt;
             GetCursorPos(out pt);
-            TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.X, pt.Y, 0, hwnd, IntPtr.Zero);
+            int x = pt.X;
+            int y = pt.Y + 2;
+            if (y + height > screenH) y = pt.Y - height - 2;
+            if (y < 0) y = 0;
+            if (x + width > screenW) x = screenW - width - 2;
+            if (x < 0) x = 0;
+
+            MoveWindow(menuMainHwnd, x, y, width, height, false);
+            SetRoundedWindowRegion(menuMainHwnd, width, height);
+
+            menuOpen = true;
+            subMenuOpen = false;
+            openedSubmenuIndex = -1;
+            menuHoverIndex = -1;
+            subMenuHoverIndex = -1;
+            pendingMenuCommand = 0;
+
+            // Foreground handshake FIRST: the process may not own the
+            // foreground when the tray icon is clicked, so grab it via the
+            // hidden tray window (classic WM_NULL trick). Showing the menu
+            // before the handshake would let the handshake deactivate the
+            // menu window and instantly close it.
+            SetForegroundWindow(hwnd);
             PostMessage(hwnd, WM_NULL, IntPtr.Zero, IntPtr.Zero);
-            DestroyMenu(menu);
+            InvalidateRect(menuMainHwnd, IntPtr.Zero, false);
+            ShowWindow(menuMainHwnd, SW_SHOW);
+            SetForegroundWindow(menuMainHwnd);
+            SetCapture(menuMainHwnd);
+
+            MSG msg;
+            while (menuOpen && GetMessage(out msg, IntPtr.Zero, 0, 0) > 0)
+            {
+                TranslateMessage(ref msg);
+                DispatchMessage(ref msg);
+            }
+
+            CloseMenu();
+            if (pendingMenuCommand != 0)
+                PostMessage(hwnd, WM_COMMAND, (IntPtr)pendingMenuCommand, IntPtr.Zero);
+        }
+
+        /// <summary>Build the skinned menu content from current core state.</summary>
+        private static void BuildMenuItems()
+        {
+            menuItems.Clear();
+
+            menuItems.Add(new MenuItemData { Text = currentStatus, Enabled = false });
+            menuItems.Add(new MenuItemData { Text = "版本 " + SelfUpdater.GetCurrentVersion(), Enabled = false });
+            menuItems.Add(new MenuItemData { Text = core.DshVersionDisplay, Enabled = false });
+
+            MenuItemData branch = new MenuItemData
+            {
+                Text = "dsh 版本分支",
+                HasSubmenu = true,
+                Submenu = new List<MenuItemData>
+                {
+                    new MenuItemData { Text = core.BranchDisplayName(AppSettings.LatestBranch), Checked = core.DshBranch == AppSettings.LatestBranch, CommandId = ID_BRANCH_LATEST },
+                    new MenuItemData { Text = core.BranchDisplayName(AppSettings.NextBranch), Checked = core.DshBranch == AppSettings.NextBranch, CommandId = ID_BRANCH_NEXT },
+                    new MenuItemData { Text = core.BranchDisplayName(AppSettings.AlphaBranch), Checked = core.DshBranch == AppSettings.AlphaBranch, CommandId = ID_BRANCH_ALPHA }
+                }
+            };
+            menuItems.Add(branch);
+
+            List<string> profiles = core.GetAvailableProfiles();
+            menuProfiles.Clear();
+            menuProfiles.AddRange(profiles);
+            MenuItemData profile = new MenuItemData
+            {
+                Text = "Profile（当前：" + core.DshProfile + "）",
+                HasSubmenu = true,
+                Submenu = new List<MenuItemData>()
+            };
+            for (int i = 0; i < profiles.Count; i++)
+            {
+                profile.Submenu.Add(new MenuItemData
+                {
+                    Text = profiles[i],
+                    Checked = core.DshProfile == profiles[i],
+                    CommandId = ID_PROFILE_FIRST + i
+                });
+            }
+            profile.Submenu.Add(new MenuItemData { IsSeparator = true });
+            profile.Submenu.Add(new MenuItemData { Text = "创建 Profile…", CommandId = ID_PROFILE_CREATE });
+            menuItems.Add(profile);
+
+            if (hasUpdateProgress)
+                menuItems.Add(new MenuItemData { Text = "显示更新进度", CommandId = ID_PROGRESS });
+
+            menuItems.Add(new MenuItemData { IsSeparator = true });
+            menuItems.Add(new MenuItemData { Text = "打开网页", CommandId = ID_OPEN });
+            menuItems.Add(new MenuItemData { Text = "启动 dsh 控制台", CommandId = ID_CONSOLE });
+            menuItems.Add(new MenuItemData { Text = "查看日志", CommandId = ID_LOG });
+            menuItems.Add(new MenuItemData { Text = "重启服务器", CommandId = ID_RESTART });
+            menuItems.Add(new MenuItemData { IsSeparator = true });
+            menuItems.Add(new MenuItemData { Text = "退出并停止服务", CommandId = ID_EXIT });
+        }
+
+        /// <summary>Measure a menu list; fills tops/heights. Returns the window width.</summary>
+        private static int MeasureMenu(List<MenuItemData> items, List<int> tops, List<int> heights,
+            bool hasArrow, ref int contentWidth)
+        {
+            tops.Clear();
+            heights.Clear();
+            IntPtr dc = CreateCompatibleDC(IntPtr.Zero);
+            IntPtr oldFont = SelectObject(dc, menuFont);
+            int maxText = 0;
+            int y = MenuPadding;
+            for (int i = 0; i < items.Count; i++)
+            {
+                tops.Add(y);
+                int h = items[i].IsSeparator ? MenuSeparatorHeight : MenuItemHeight;
+                heights.Add(h);
+                if (!items[i].IsSeparator)
+                {
+                    RECT r = new RECT(0, 0, 0, 0);
+                    DrawText(dc, items[i].Text ?? string.Empty, -1, ref r,
+                        DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+                    int w = r.Right - r.Left;
+                    if (w > maxText) maxText = w;
+                }
+                y += h;
+            }
+            SelectObject(dc, oldFont);
+            DeleteDC(dc);
+
+            int arrowReserve = hasArrow ? 26 : 6;
+            contentWidth = maxText + 30 + arrowReserve + MenuPadding * 2 + 2;
+            return contentWidth;
+        }
+
+        private static void EnsureMenuWindows()
+        {
+            if (menuMainHwnd != IntPtr.Zero) return;
+            IntPtr hInstance = GetModuleHandle(null);
+            menuMainHwnd = CreateWindowEx(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, ClassName,
+                "dsh-tray-menu", WS_POPUP,
+                0, 0, 10, 10, IntPtr.Zero, IntPtr.Zero, hInstance, IntPtr.Zero);
+            if (menuMainHwnd == IntPtr.Zero) return;
+            menuSubHwnd = CreateWindowEx(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, ClassName,
+                "dsh-tray-submenu", WS_POPUP,
+                0, 0, 10, 10, IntPtr.Zero, IntPtr.Zero, hInstance, IntPtr.Zero);
+            menuFont = CreateUiFont(-13, 400, "Microsoft YaHei UI");
+        }
+
+        private static void SetRoundedWindowRegion(IntPtr win, int width, int height)
+        {
+            try
+            {
+                IntPtr region = CreateRoundRectRgn(0, 0, width + 1, height + 1, 8, 8);
+                SetWindowRgn(win, region, true);
+            }
+            catch
+            {
+            }
+        }
+
+        private static void OpenSubmenu(int index)
+        {
+            MenuItemData item = menuItems[index];
+            if (item.Submenu == null) return;
+
+            subMenuItems.Clear();
+            subMenuItems.AddRange(item.Submenu);
+            int width = MeasureMenu(subMenuItems, subItemTops, subItemHeights, false, ref subMenuContentWidth);
+            int height = MenuPadding * 2 + (subItemTops.Count > 0 ? subItemTops[subItemTops.Count - 1] + subItemHeights[subItemHeights.Count - 1] : 0);
+
+            RECT wr;
+            GetWindowRect(menuMainHwnd, out wr);
+            int x = wr.Right - 2;
+            int y = wr.Top + menuItemTops[index];
+            int screenW = GetSystemMetrics(SM_CXSCREEN);
+            int screenH = GetSystemMetrics(SM_CYSCREEN);
+            if (x + width > screenW) x = wr.Left - width + 2;
+            if (x < 0) x = 0;
+            if (y + height > screenH) y = screenH - height;
+            if (y < 0) y = 0;
+
+            MoveWindow(menuSubHwnd, x, y, width, height, false);
+            SetRoundedWindowRegion(menuSubHwnd, width, height);
+            subMenuOpen = true;
+            openedSubmenuIndex = index;
+            subMenuHoverIndex = -1;
+            InvalidateRect(menuSubHwnd, IntPtr.Zero, false);
+            ShowWindow(menuSubHwnd, SW_SHOWNOACTIVATE);
+        }
+
+        private static bool PointInWindow(IntPtr win, POINT pt)
+        {
+            RECT wr;
+            GetWindowRect(win, out wr);
+            return pt.X >= wr.Left && pt.X < wr.Right && pt.Y >= wr.Top && pt.Y < wr.Bottom;
+        }
+
+        private static int HitTestMenu(IntPtr win, List<MenuItemData> items, List<int> tops, List<int> heights, POINT pt)
+        {
+            RECT wr;
+            GetWindowRect(win, out wr);
+            if (pt.X < wr.Left || pt.X >= wr.Right || pt.Y < wr.Top || pt.Y >= wr.Bottom) return -1;
+            int localY = pt.Y - wr.Top;
+            for (int i = 0; i < items.Count; i++)
+            {
+                if (localY >= tops[i] && localY < tops[i] + heights[i])
+                    return items[i].IsSeparator ? -1 : i;
+            }
+            return -1;
+        }
+
+        private static void UpdateMenuHover()
+        {
+            POINT pt;
+            GetCursorPos(out pt);
+
+            if (subMenuOpen && PointInWindow(menuSubHwnd, pt))
+            {
+                int idx = HitTestMenu(menuSubHwnd, subMenuItems, subItemTops, subItemHeights, pt);
+                if (idx != subMenuHoverIndex)
+                {
+                    subMenuHoverIndex = idx;
+                    InvalidateRect(menuSubHwnd, IntPtr.Zero, false);
+                }
+                return;
+            }
+
+            if (!PointInWindow(menuMainHwnd, pt)) return;
+            int hover = HitTestMenu(menuMainHwnd, menuItems, menuItemTops, menuItemHeights, pt);
+            if (hover != menuHoverIndex)
+            {
+                menuHoverIndex = hover;
+                InvalidateRect(menuMainHwnd, IntPtr.Zero, false);
+            }
+            // Keep the open submenu while the pointer stays on its parent item (or
+            // off the menu), switch/hide it only when another item is hovered.
+            if (subMenuOpen && hover >= 0 && hover != openedSubmenuIndex)
+            {
+                subMenuOpen = false;
+                openedSubmenuIndex = -1;
+                subMenuHoverIndex = -1;
+                ShowWindow(menuSubHwnd, SW_HIDE);
+            }
+            if (hover >= 0 && menuItems[hover].HasSubmenu && openedSubmenuIndex != hover)
+                OpenSubmenu(hover);
+        }
+
+        private static void HandleMenuClick()
+        {
+            POINT pt;
+            GetCursorPos(out pt);
+
+            if (subMenuOpen && PointInWindow(menuSubHwnd, pt))
+            {
+                if (subMenuHoverIndex >= 0)
+                    pendingMenuCommand = subMenuItems[subMenuHoverIndex].CommandId;
+                menuOpen = false;
+                return;
+            }
+
+            if (menuHoverIndex >= 0 && PointInWindow(menuMainHwnd, pt))
+            {
+                MenuItemData item = menuItems[menuHoverIndex];
+                if (item.HasSubmenu)
+                {
+                    OpenSubmenu(menuHoverIndex);
+                    return;
+                }
+                pendingMenuCommand = item.CommandId;
+                menuOpen = false;
+                return;
+            }
+
+            // Clicked outside: dismiss.
+            menuOpen = false;
+        }
+
+        private static void CloseMenu()
+        {
+            menuOpen = false;
+            subMenuOpen = false;
+            openedSubmenuIndex = -1;
+            menuHoverIndex = -1;
+            subMenuHoverIndex = -1;
+            try { ReleaseCapture(); } catch { }
+            if (menuMainHwnd != IntPtr.Zero) ShowWindow(menuMainHwnd, SW_HIDE);
+            if (menuSubHwnd != IntPtr.Zero) ShowWindow(menuSubHwnd, SW_HIDE);
+        }
+
+        private static IntPtr MenuWndProc(IntPtr win, uint msg, IntPtr wParam, IntPtr lParam)
+        {
+            if (win == menuMainHwnd)
+            {
+                if (msg == WM_ACTIVATE && (wParam.ToInt64() & 0xffff) == 0) { menuOpen = false; return IntPtr.Zero; }
+                if (msg == WM_CAPTURECHANGED) { menuOpen = false; return IntPtr.Zero; }
+                if (msg == WM_KEYDOWN && wParam.ToInt32() == 0x1B) { menuOpen = false; return IntPtr.Zero; }
+                if (msg == WM_MOUSEMOVE) { UpdateMenuHover(); return IntPtr.Zero; }
+                if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN)
+                {
+                    POINT pt;
+                    GetCursorPos(out pt);
+                    if (!PointInWindow(menuMainHwnd, pt)
+                        && !(subMenuOpen && PointInWindow(menuSubHwnd, pt)))
+                    {
+                        menuOpen = false;
+                    }
+                    return IntPtr.Zero;
+                }
+                if (msg == WM_LBUTTONUP || msg == WM_RBUTTONUP) { HandleMenuClick(); return IntPtr.Zero; }
+                if (msg == WM_PAINT) { PaintMenuWindow(menuMainHwnd); return IntPtr.Zero; }
+                if (msg == WM_ERASEBKGND) return (IntPtr)1;
+                if (msg == WM_SETTINGCHANGE) { RefreshSystemTheme(); InvalidateRect(menuMainHwnd, IntPtr.Zero, false); return IntPtr.Zero; }
+            }
+            else if (win == menuSubHwnd)
+            {
+                if (msg == WM_PAINT) { PaintMenuWindow(menuSubHwnd); return IntPtr.Zero; }
+                if (msg == WM_ERASEBKGND) return (IntPtr)1;
+            }
+            return DefWindowProc(win, msg, wParam, lParam);
+        }
+
+        private static void PaintMenuWindow(IntPtr win)
+        {
+            bool main = win == menuMainHwnd;
+            List<MenuItemData> items = main ? menuItems : subMenuItems;
+            List<int> tops = main ? menuItemTops : subItemTops;
+            List<int> heights = main ? menuItemHeights : subItemHeights;
+            int hover = main ? menuHoverIndex : subMenuHoverIndex;
+
+            PAINTSTRUCT paint;
+            IntPtr target = BeginPaint(win, out paint);
+            if (target == IntPtr.Zero) return;
+
+            RECT client;
+            GetClientRect(win, out client);
+            IntPtr buffer = CreateCompatibleDC(target);
+            IntPtr bitmap = CreateCompatibleBitmap(target, client.Right, client.Bottom);
+            IntPtr oldBitmap = SelectObject(buffer, bitmap);
+
+            int background = useDarkTheme ? Rgb(31, 33, 36) : Rgb(250, 251, 252);
+            int textColor = useDarkTheme ? Rgb(242, 244, 246) : Rgb(38, 44, 51);
+            int dimColor = useDarkTheme ? Rgb(169, 176, 184) : Rgb(100, 108, 118);
+            int hoverColor = useDarkTheme ? Rgb(45, 49, 54) : Rgb(232, 235, 238);
+            int sepColor = useDarkTheme ? Rgb(55, 60, 66) : Rgb(222, 226, 230);
+            int accent = useDarkTheme ? Rgb(45, 169, 151) : Rgb(23, 126, 113);
+            FillColor(buffer, client, background);
+
+            for (int i = 0; i < items.Count; i++)
+            {
+                MenuItemData item = items[i];
+                if (item.IsSeparator)
+                {
+                    RECT line = new RECT(16, tops[i] + heights[i] / 2, client.Right - 16, tops[i] + heights[i] / 2 + 1);
+                    FillColor(buffer, line, sepColor);
+                    continue;
+                }
+
+                RECT row = new RECT(0, tops[i], client.Right, tops[i] + heights[i]);
+                if (i == hover && item.Enabled)
+                {
+                    RECT hl = new RECT(6, row.Top + 3, row.Right - 6, row.Bottom - 3);
+                    FillRounded(buffer, hl, 6, hoverColor);
+                }
+                if (item.Checked)
+                {
+                    RECT dot = new RECT(16, row.Top + heights[i] / 2 - 3, 22, row.Top + heights[i] / 2 + 3);
+                    FillRounded(buffer, dot, 3, accent);
+                }
+
+                RECT textRect = new RECT(30, row.Top, row.Right - (item.HasSubmenu ? 34 : 14), row.Bottom);
+                DrawLabel(buffer, item.Text ?? string.Empty, textRect, menuFont,
+                    item.Enabled ? textColor : dimColor,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+                if (item.HasSubmenu)
+                {
+                    RECT arrowRect = new RECT(row.Right - 26, row.Top, row.Right - 10, row.Bottom);
+                    DrawLabel(buffer, "›", arrowRect, menuFont, textColor,
+                        DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                }
+            }
+            BitBlt(target, 0, 0, client.Right, client.Bottom, buffer, 0, 0, SRCCOPY);
+            SelectObject(buffer, oldBitmap);
+            DeleteObject(bitmap);
+            DeleteDC(buffer);
+            EndPaint(win, ref paint);
         }
 
         private static void QueueNotification(string title, string text)
@@ -685,6 +1214,222 @@ namespace DshTray
 
         private static string pendingPromptTag;
         private static string pendingPromptCurrentVersion;
+
+        /// <summary>
+        /// Skinned modal dialog prompting for a new profile name. Blocks until
+        /// the user clicks 创建/取消 (or presses Enter/Escape in the edit box).
+        /// Returns the typed name, or null when cancelled.
+        /// </summary>
+        private static string ShowCreateProfileDialog()
+        {
+            if (createProfileHwnd == IntPtr.Zero)
+            {
+                const int width = 480;
+                const int height = 248;
+                int x = Math.Max(0, (GetSystemMetrics(SM_CXSCREEN) - width) / 2);
+                int y = Math.Max(0, (GetSystemMetrics(SM_CYSCREEN) - height) / 3);
+                IntPtr hInstance = GetModuleHandle(null);
+                createProfileHwnd = CreateWindowEx(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, ClassName,
+                    "创建 Profile", WS_CAPTION | WS_SYSMENU,
+                    x, y, width, height, IntPtr.Zero, IntPtr.Zero, hInstance, IntPtr.Zero);
+                if (createProfileHwnd == IntPtr.Zero) return null;
+                SendMessage(createProfileHwnd, 0x0080, (IntPtr)1, hIcon); // WM_SETICON / ICON_BIG
+                RefreshSystemTheme();
+                if (promptTitleFont == IntPtr.Zero) promptTitleFont = CreateUiFont(-22, 600, "Microsoft YaHei UI");
+                if (promptBodyFont == IntPtr.Zero) promptBodyFont = CreateUiFont(-13, 400, "Microsoft YaHei UI");
+                if (createProfileEditHwnd == IntPtr.Zero)
+                {
+                    createProfileEditHwnd = CreateWindowEx(0x00000200 /* WS_EX_CLIENTEDGE */, "EDIT", "",
+                        0x40000000 /* WS_CHILD */ | 0x10000000 /* WS_VISIBLE */ | 0x00010000 /* WS_TABSTOP */
+                        | 0x0080 /* ES_AUTOHSCROLL (0x2000 would be ES_NUMBER!) */,
+                        24, 100, width - 48, 34, createProfileHwnd, IntPtr.Zero, hInstance, IntPtr.Zero);
+                    if (createProfileEditHwnd != IntPtr.Zero)
+                    {
+                        SendMessage(createProfileEditHwnd, 0x0030 /* WM_SETFONT */, promptBodyFont, new IntPtr(1));
+                        SetWindowText(createProfileEditHwnd, "");
+                    }
+                }
+            }
+
+            createProfileResult = -1;
+            createProfileError = null;
+            hoveredCreateButton = 0;
+            pressedCreateButton = 0;
+            if (createProfileEditHwnd != IntPtr.Zero) SetWindowText(createProfileEditHwnd, "");
+            InvalidateRect(createProfileHwnd, IntPtr.Zero, false);
+            ShowWindow(createProfileHwnd, SW_SHOW);
+            SetForegroundWindow(createProfileHwnd);
+            SetFocus(createProfileEditHwnd);
+
+            MSG msg;
+            while (createProfileResult == -1 && GetMessage(out msg, IntPtr.Zero, 0, 0) > 0)
+            {
+                // The EDIT control consumes Enter/Escape itself, so confirm the
+                // dialog from the modal pump before the key goes to the control.
+                if (msg.message == WM_KEYDOWN && msg.hwnd == createProfileEditHwnd)
+                {
+                    int vk = msg.wParam.ToInt32();
+                    if (vk == 0x0D)
+                    {
+                        string name = ReadCreateProfileInput();
+                        if (!AppSettings.IsValidProfileName(name))
+                        {
+                            // Same inline validation as the 创建 button: stay
+                            // open and explain why the name was rejected.
+                            createProfileError = CreateProfileErrorText;
+                            InvalidateRect(createProfileHwnd, IntPtr.Zero, false);
+                            continue;
+                        }
+                        createProfileResult = 0;
+                        break;
+                    }
+                    if (vk == 0x1B) { createProfileResult = 1; break; }
+                }
+                TranslateMessage(ref msg);
+                DispatchMessage(ref msg);
+            }
+
+            ShowWindow(createProfileHwnd, SW_HIDE);
+            if (createProfileResult != 0) return null;
+            return ReadCreateProfileInput();
+        }
+
+        private static string ReadCreateProfileInput()
+        {
+            try
+            {
+                int len = GetWindowTextLength(createProfileEditHwnd);
+                if (len <= 0) return string.Empty;
+                StringBuilder sb = new StringBuilder(len + 1);
+                GetWindowText(createProfileEditHwnd, sb, sb.Capacity);
+                return sb.ToString().Trim();
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }
+
+        private static void CreateProfileFromDialog()
+        {
+            string name = ShowCreateProfileDialog();
+            if (string.IsNullOrEmpty(name)) return;
+            string error;
+            if (!core.CreateProfile(name, out error))
+            {
+                MessageBox(hwnd, "创建 Profile 失败：\n" + error, "创建 Profile",
+                    0x00000010 /* MB_ICONERROR */ | 0x00000000 /* MB_OK */);
+                return;
+            }
+            core.SetDshProfile(name);
+            QueueNotification("DeepSeek Harness", "Profile " + name + " 已创建并切换。");
+        }
+
+        private static RECT GetCreateOkRect(RECT client)
+        {
+            return new RECT(client.Right - 144, client.Bottom - 56, client.Right - 24, client.Bottom - 20);
+        }
+
+        private static RECT GetCreateCancelRect(RECT client)
+        {
+            return new RECT(client.Right - 274, client.Bottom - 56, client.Right - 154, client.Bottom - 20);
+        }
+
+        private static int GetCreateButtonAt(int x, int y)
+        {
+            RECT client;
+            GetClientRect(createProfileHwnd, out client);
+            if (PointInRect(GetCreateOkRect(client), x, y)) return 1;
+            if (PointInRect(GetCreateCancelRect(client), x, y)) return 2;
+            return 0;
+        }
+
+        private static void PaintCreateProfileDialog()
+        {
+            PAINTSTRUCT paint;
+            IntPtr target = BeginPaint(createProfileHwnd, out paint);
+            if (target == IntPtr.Zero) return;
+
+            RECT client;
+            GetClientRect(createProfileHwnd, out client);
+            IntPtr buffer = CreateCompatibleDC(target);
+            IntPtr bitmap = CreateCompatibleBitmap(target, client.Right, client.Bottom);
+            IntPtr oldBitmap = SelectObject(buffer, bitmap);
+
+            int background = useDarkTheme ? Rgb(31, 33, 36) : Rgb(250, 251, 252);
+            int heading = useDarkTheme ? Rgb(242, 244, 246) : Rgb(24, 29, 35);
+            int secondary = useDarkTheme ? Rgb(169, 176, 184) : Rgb(91, 99, 108);
+            int errorColor = useDarkTheme ? Rgb(240, 122, 122) : Rgb(190, 60, 60);
+            int accent = useDarkTheme ? Rgb(45, 169, 151) : Rgb(23, 126, 113);
+            FillColor(buffer, client, background);
+
+            RECT titleRect = new RECT(24, 20, client.Right - 24, 52);
+            DrawLabel(buffer, "创建 Profile", titleRect, promptTitleFont, heading,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+            RECT bodyRect = new RECT(24, 58, client.Right - 24, 100);
+            DrawLabel(buffer,
+                "新 profile 将作为独立的 DSH 配置运行 web 服务。\n名称仅允许字母、数字、-、_、.，且以字母或数字开头。",
+                bodyRect, promptBodyFont, secondary,
+                DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+            // Edit-box frame; the EDIT child window paints itself on top.
+            RECT editRect = new RECT(24, 100, client.Right - 24, 134);
+            FillRounded(buffer, editRect, 6, useDarkTheme ? Rgb(55, 60, 66) : Rgb(222, 226, 230));
+
+            if (!string.IsNullOrEmpty(createProfileError))
+            {
+                RECT errorRect = new RECT(24, 136, client.Right - 24, 170);
+                DrawLabel(buffer, createProfileError, errorRect, promptBodyFont, errorColor,
+                    DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+            }
+
+            RECT okRect = GetCreateOkRect(client);
+            int okColor = useDarkTheme
+                ? (pressedCreateButton == 1 ? Rgb(25, 126, 112)
+                    : hoveredCreateButton == 1 ? Rgb(54, 186, 166) : accent)
+                : (pressedCreateButton == 1 ? Rgb(12, 91, 82)
+                    : hoveredCreateButton == 1 ? Rgb(15, 110, 99) : accent);
+            FillRounded(buffer, okRect, 6, okColor);
+            DrawLabel(buffer, "创建", okRect, promptBodyFont, Rgb(255, 255, 255),
+                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | 0x0001);
+
+            RECT cancelRect = GetCreateCancelRect(client);
+            int cancelColor = useDarkTheme
+                ? (pressedCreateButton == 2 ? Rgb(83, 89, 96)
+                    : hoveredCreateButton == 2 ? Rgb(70, 76, 82) : Rgb(55, 60, 66))
+                : (pressedCreateButton == 2 ? Rgb(205, 211, 216)
+                    : hoveredCreateButton == 2 ? Rgb(218, 223, 227) : Rgb(232, 235, 238));
+            FillRounded(buffer, cancelRect, 6, cancelColor);
+            DrawLabel(buffer, "取消", cancelRect, promptBodyFont,
+                useDarkTheme ? Rgb(242, 244, 246) : Rgb(38, 44, 51),
+                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | 0x0001);
+
+            BitBlt(target, 0, 0, client.Right, client.Bottom, buffer, 0, 0, SRCCOPY);
+            SelectObject(buffer, oldBitmap);
+            DeleteObject(bitmap);
+            DeleteDC(buffer);
+            EndPaint(createProfileHwnd, ref paint);
+        }
+
+        private static IntPtr EnsureCreateEditBrush()
+        {
+            if (createEditBrush == IntPtr.Zero)
+            {
+                int color = useDarkTheme ? Rgb(45, 49, 54) : Rgb(255, 255, 255);
+                createEditBrush = CreateSolidBrush(color);
+            }
+            return createEditBrush;
+        }
+
+        private static void DestroyCreateEditBrush()
+        {
+            if (createEditBrush != IntPtr.Zero)
+            {
+                DeleteObject(createEditBrush);
+                createEditBrush = IntPtr.Zero;
+            }
+        }
 
         private static void DrainStatus()
         {
@@ -1069,7 +1814,7 @@ namespace DshTray
             int heading = useDarkTheme ? Rgb(242, 244, 246) : Rgb(24, 29, 35);
             int secondary = useDarkTheme ? Rgb(169, 176, 184) : Rgb(91, 99, 108);
             int logText = useDarkTheme ? Rgb(215, 219, 224) : Rgb(51, 58, 66);
-            int trackColor = useDarkTheme ? Rgb(67, 72, 78) : Rgb(222, 226, 230);
+            int trackColor = useDarkTheme ? Rgb(55, 60, 66) : Rgb(222, 226, 230);
             int accent = useDarkTheme ? Rgb(45, 169, 151) : Rgb(23, 126, 113);
             FillColor(buffer, client, background);
 
@@ -1077,7 +1822,7 @@ namespace DshTray
             DrawLabel(buffer, currentProgressStage, stageRect, headingFont, heading,
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
 
-            RECT track = new RECT(24, 68, client.Right - 24, 74);
+            RECT track = new RECT(24, 68, client.Right - 24, 76);
             FillRounded(buffer, track, 6, trackColor);
             if (currentProgressPercent >= 0)
             {
@@ -1255,6 +2000,24 @@ namespace DshTray
                 DestroyWindow(updatePromptHwnd);
                 updatePromptHwnd = IntPtr.Zero;
             }
+            if (createProfileHwnd != IntPtr.Zero)
+            {
+                DestroyWindow(createProfileHwnd);
+                createProfileHwnd = IntPtr.Zero;
+                createProfileEditHwnd = IntPtr.Zero;
+            }
+            DestroyCreateEditBrush();
+            if (menuMainHwnd != IntPtr.Zero)
+            {
+                DestroyWindow(menuMainHwnd);
+                menuMainHwnd = IntPtr.Zero;
+            }
+            if (menuSubHwnd != IntPtr.Zero)
+            {
+                DestroyWindow(menuSubHwnd);
+                menuSubHwnd = IntPtr.Zero;
+            }
+            if (menuFont != IntPtr.Zero) { DeleteObject(menuFont); menuFont = IntPtr.Zero; }
             if (headingFont != IntPtr.Zero) { DeleteObject(headingFont); headingFont = IntPtr.Zero; }
             if (bodyFont != IntPtr.Zero) { DeleteObject(bodyFont); bodyFont = IntPtr.Zero; }
             if (logFont != IntPtr.Zero) { DeleteObject(logFont); logFont = IntPtr.Zero; }
@@ -1452,6 +2215,27 @@ namespace DshTray
         private static extern bool SetWindowText(IntPtr hWnd, string lpString);
 
         [DllImport("user32.dll")]
+        private static extern bool MoveWindow(IntPtr hWnd, int x, int y, int nWidth, int nHeight, bool bRepaint);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetWindowRgn(IntPtr hWnd, IntPtr hRgn, bool bRedraw);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+        [DllImport("gdi32.dll")]
+        private static extern IntPtr CreateRoundRectRgn(int x1, int y1, int x2, int y2, int cx, int cy);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+        [DllImport("user32.dll")]
+        private static extern int GetWindowTextLength(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr SetFocus(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
         private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
         [DllImport("user32.dll")]
@@ -1516,6 +2300,9 @@ namespace DshTray
 
         [DllImport("gdi32.dll")]
         private static extern int SetTextColor(IntPtr hdc, int color);
+
+        [DllImport("gdi32.dll")]
+        private static extern uint SetBkColor(IntPtr hdc, uint color);
 
         [DllImport("gdi32.dll", CharSet = CharSet.Unicode)]
         private static extern IntPtr CreateFont(int height, int width, int escapement, int orientation,

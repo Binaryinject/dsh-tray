@@ -24,6 +24,9 @@ namespace DshTray
         private static NSMenuItem branchLatestItem;
         private static NSMenuItem branchNextItem;
         private static NSMenuItem branchAlphaItem;
+        private static NSMenu profileMenu;
+        private static NSMenuItem profileParentItem;
+        private static readonly System.Collections.Generic.List<string> profileMenuNames = new System.Collections.Generic.List<string>();
         private static NSPanel progressPanel;
         private static NSTextField progressStatus;
         private static NSScrollView progressLogScroll;
@@ -74,6 +77,12 @@ namespace DshTray
             NSMenuItem branchParent = new NSMenuItem { Title = "dsh 版本分支" };
             branchParent.Submenu = branchMenu;
             menu.AddItem(branchParent);
+
+            profileMenu = new NSMenu();
+            profileParentItem = new NSMenuItem { Title = "Profile（当前：web）" };
+            profileParentItem.Submenu = profileMenu;
+            menu.AddItem(profileParentItem);
+            RefreshProfileMenu();
 
             menu.AddItem(progressMenuItem);
             menu.AddItem(NSMenuItem.SeparatorItem);
@@ -166,6 +175,30 @@ namespace DshTray
             item.Tag = tag;
             item.State = core.DshBranch == branch ? NSCellStateValue.On : NSCellStateValue.Off;
             return item;
+        }
+
+        /// <summary>Rebuild the Profile submenu from the discovered profiles and
+        /// refresh its parent title (called after boot, switch, and create).</summary>
+        private static void RefreshProfileMenu()
+        {
+            if (profileMenu == null) return;
+            profileMenu.RemoveAllItems();
+            profileMenuNames.Clear();
+
+            System.Collections.Generic.List<string> profiles = core.GetAvailableProfiles();
+            for (int i = 0; i < profiles.Count; i++)
+            {
+                profileMenuNames.Add(profiles[i]);
+                NSMenuItem item = MakeItem(profiles[i], "setProfile:", actions);
+                item.Tag = i;
+                item.State = core.DshProfile == profiles[i] ? NSCellStateValue.On : NSCellStateValue.Off;
+                profileMenu.AddItem(item);
+            }
+            profileMenu.AddItem(NSMenuItem.SeparatorItem);
+            profileMenu.AddItem(MakeItem("创建 Profile…", "createProfile:", actions));
+
+            if (profileParentItem != null)
+                profileParentItem.Title = "Profile（当前：" + core.DshProfile + "）";
         }
 
         private static void RefreshDshMenuTitles()
@@ -489,6 +522,53 @@ namespace DshTray
                     : item.Tag == 2 ? AppSettings.NextBranch
                     : AppSettings.AlphaBranch;
                 core.SetDshBranch(branch);
+            }
+
+            [Export("setProfile:")]
+            public void SetProfile(NSObject sender)
+            {
+                NSMenuItem item = sender as NSMenuItem;
+                if (item == null) return;
+                int index = (int)item.Tag;
+                if (index < 0 || index >= profileMenuNames.Count) return;
+                core.SetDshProfile(profileMenuNames[index]);
+                RefreshProfileMenu();
+            }
+
+            [Export("createProfile:")]
+            public void CreateProfile(NSObject sender)
+            {
+                NSAlert alert = new NSAlert();
+                alert.MessageText = "创建 Profile";
+                alert.InformativeText = "输入新 Profile 名称（字母、数字、-、_、.，以字母或数字开头）：";
+                NSTextField input = new NSTextField(new CGRect(0, 0, 240, 24));
+                alert.AccessoryView = input;
+                alert.AddButton("创建");
+                alert.AddButton("取消");
+                long result = (long)alert.RunModal();
+                if (result != 1000 /* NSAlertFirstButtonReturn */) return;
+
+                string name = (input.StringValue ?? "").Trim();
+                if (!AppSettings.IsValidProfileName(name))
+                {
+                    NSAlert invalid = new NSAlert();
+                    invalid.MessageText = "名称无效";
+                    invalid.InformativeText = "仅允许字母、数字、-、_、.，且以字母或数字开头（desktop 与 node_modules 为保留名）。";
+                    invalid.RunModal();
+                    return;
+                }
+                string error;
+                if (!core.CreateProfile(name, out error))
+                {
+                    NSAlert failed = new NSAlert();
+                    failed.MessageText = "创建 Profile 失败";
+                    failed.InformativeText = error ?? "未知错误";
+                    failed.RunModal();
+                    return;
+                }
+                core.SetDshProfile(name);
+                RefreshProfileMenu();
+                NotifyToWindow("Profile " + name + " 已创建并切换。");
             }
 
             [Export("quit:")]
