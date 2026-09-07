@@ -1,4 +1,4 @@
-name: Build & Release
+﻿name: Build & Release
 
 on:
   push:
@@ -60,7 +60,7 @@ jobs:
       - name: Package DMG (macOS)
         if: runner.os == 'macOS'
         shell: bash
-        run: bash scripts/package-macos.sh ${{ matrix.rid }} 0.1.16
+        run: bash scripts/package-macos.sh ${{ matrix.rid }} 0.1.17
 
       - uses: actions/upload-artifact@v4
         with:

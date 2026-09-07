@@ -51,6 +51,7 @@ namespace DshTray
         private const int ID_BRANCH_NEXT = 2002;
         private const int ID_BRANCH_ALPHA = 2003;
         private const int ID_PROFILE_FIRST = 3001;
+        private const int ID_PROFILE_DELETE = 3998;
         private const int ID_PROFILE_CREATE = 3999;
 
         private const uint MF_STRING = 0x0000;
@@ -128,6 +129,16 @@ namespace DshTray
         private static IntPtr createEditBrush;
         private static readonly List<string> menuProfiles = new List<string>();
         private const string CreateProfileErrorText = "名称无效：仅允许字母、数字、-、_、.，\n且以字母或数字开头。";
+
+        // ---- Delete-profile dialog state ----
+        private static IntPtr deleteProfileHwnd;
+        private static readonly List<string> deleteProfileNames = new List<string>();
+        private static int deleteProfileSelected = -1;
+        private static int deleteProfileHover = -1;
+        private static int deleteProfileResult = -1;
+        private static int hoveredDeleteButton;
+        private static int pressedDeleteButton;
+        private static string deleteProfileError;
 
         // ---- Skinned popup menu state ----
         private sealed class MenuItemData
@@ -300,6 +311,7 @@ namespace DshTray
                 else if (id >= ID_PROFILE_FIRST && id < ID_PROFILE_FIRST + menuProfiles.Count)
                     core.SetDshProfile(menuProfiles[id - ID_PROFILE_FIRST]);
                 else if (id == ID_PROFILE_CREATE) CreateProfileFromDialog();
+                else if (id == ID_PROFILE_DELETE) DeleteProfileFromDialog();
                 else if (id == ID_EXIT) Shutdown();
                 return IntPtr.Zero;
             }
@@ -521,6 +533,119 @@ namespace DshTray
                 return EnsureCreateEditBrush();
             }
 
+            if (hWnd == deleteProfileHwnd && msg == WM_CLOSE)
+            {
+                deleteProfileResult = 1;
+                ShowWindow(deleteProfileHwnd, SW_HIDE);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == deleteProfileHwnd && msg == WM_KEYDOWN && wParam.ToInt32() == 0x1B)
+            {
+                deleteProfileResult = 1;
+                ShowWindow(deleteProfileHwnd, SW_HIDE);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == deleteProfileHwnd && msg == WM_LBUTTONDOWN)
+            {
+                int x = (short)((long)lParam & 0xffff);
+                int y = (short)(((long)lParam >> 16) & 0xffff);
+                int row = HitTestDeleteList(x, y);
+                if (row >= 0 && row < deleteProfileNames.Count
+                    && !string.Equals(deleteProfileNames[row], core.DshProfile, StringComparison.Ordinal))
+                {
+                    deleteProfileSelected = row;
+                    deleteProfileError = null;
+                    InvalidateRect(deleteProfileHwnd, IntPtr.Zero, false);
+                    return IntPtr.Zero;
+                }
+                pressedDeleteButton = GetDeleteButtonAt(x, y);
+                if (pressedDeleteButton != 0) SetCapture(deleteProfileHwnd);
+                InvalidateRect(deleteProfileHwnd, IntPtr.Zero, false);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == deleteProfileHwnd && msg == WM_LBUTTONUP)
+            {
+                int x = (short)((long)lParam & 0xffff);
+                int y = (short)(((long)lParam >> 16) & 0xffff);
+                int button = GetDeleteButtonAt(x, y);
+                int clicked = pressedDeleteButton == button ? button : 0;
+                pressedDeleteButton = 0;
+                ReleaseCapture();
+                InvalidateRect(deleteProfileHwnd, IntPtr.Zero, false);
+                if (clicked == 1)
+                {
+                    if (deleteProfileSelected < 0 || deleteProfileSelected >= deleteProfileNames.Count
+                        || string.Equals(deleteProfileNames[deleteProfileSelected], core.DshProfile, StringComparison.Ordinal))
+                    {
+                        deleteProfileError = "请先选择一个可删除的 Profile。";
+                        InvalidateRect(deleteProfileHwnd, IntPtr.Zero, false);
+                        return IntPtr.Zero;
+                    }
+                    deleteProfileResult = 0;
+                }
+                else if (clicked == 2) deleteProfileResult = 1;
+                if (deleteProfileResult != -1)
+                {
+                    ShowWindow(deleteProfileHwnd, SW_HIDE);
+                    PostMessage(hwnd, WM_NULL, IntPtr.Zero, IntPtr.Zero);
+                }
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == deleteProfileHwnd && msg == WM_MOUSEMOVE)
+            {
+                int x = (short)((long)lParam & 0xffff);
+                int y = (short)(((long)lParam >> 16) & 0xffff);
+                int row = HitTestDeleteList(x, y);
+                if (row >= 0 && row < deleteProfileNames.Count
+                    && string.Equals(deleteProfileNames[row], core.DshProfile, StringComparison.Ordinal))
+                    row = -1; // never hover the profile in use
+                if (row != deleteProfileHover)
+                {
+                    deleteProfileHover = row;
+                    InvalidateRect(deleteProfileHwnd, IntPtr.Zero, false);
+                }
+                int button = GetDeleteButtonAt(x, y);
+                if (button != hoveredDeleteButton)
+                {
+                    hoveredDeleteButton = button;
+                    InvalidateRect(deleteProfileHwnd, IntPtr.Zero, false);
+                }
+                if (button != 0) SetCursor(LoadCursor(IntPtr.Zero, (IntPtr)IDC_HAND));
+                TRACKMOUSEEVENT tracking = new TRACKMOUSEEVENT();
+                tracking.cbSize = (uint)Marshal.SizeOf<TRACKMOUSEEVENT>();
+                tracking.dwFlags = TME_LEAVE;
+                tracking.hwndTrack = deleteProfileHwnd;
+                TrackMouseEvent(ref tracking);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == deleteProfileHwnd && msg == WM_MOUSELEAVE)
+            {
+                deleteProfileHover = -1;
+                hoveredDeleteButton = 0;
+                if (pressedDeleteButton == 0) InvalidateRect(deleteProfileHwnd, IntPtr.Zero, false);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == deleteProfileHwnd && msg == WM_PAINT)
+            {
+                PaintDeleteProfileDialog();
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == deleteProfileHwnd && msg == WM_ERASEBKGND) return (IntPtr)1;
+
+            if (hWnd == deleteProfileHwnd && msg == WM_SETTINGCHANGE)
+            {
+                RefreshSystemTheme();
+                InvalidateRect(deleteProfileHwnd, IntPtr.Zero, false);
+                return IntPtr.Zero;
+            }
+
             if (hWnd == progressHwnd && msg == WM_CLOSE)
             {
                 progressDismissedByUser = true;
@@ -738,6 +863,7 @@ namespace DshTray
             }
             profile.Submenu.Add(new MenuItemData { IsSeparator = true });
             profile.Submenu.Add(new MenuItemData { Text = "创建 Profile…", CommandId = ID_PROFILE_CREATE });
+            profile.Submenu.Add(new MenuItemData { Text = "删除 Profile…", CommandId = ID_PROFILE_DELETE });
             menuItems.Add(profile);
 
             if (hasUpdateProgress)
@@ -1323,6 +1449,215 @@ namespace DshTray
             }
             core.SetDshProfile(name);
             QueueNotification("DeepSeek Harness", "Profile " + name + " 已创建并切换。");
+        }
+
+        /// <summary>Number of profile rows shown in the delete dialog before truncation.</summary>
+        private const int DeleteProfileMaxRows = 8;
+
+        private static void DeleteProfileFromDialog()
+        {
+            string name = ShowDeleteProfileDialog();
+            if (string.IsNullOrEmpty(name)) return;
+
+            int answer = MessageBox(hwnd,
+                "确定删除 Profile「" + name + "」吗？\n将删除该 Profile 的全部插件与配置，操作不可恢复。",
+                "删除 Profile",
+                0x00000004 /* MB_YESNO */ | 0x00000030 /* MB_ICONWARNING */);
+            if (answer != 6 /* IDYES */) return;
+
+            string error;
+            if (!core.DeleteProfile(name, out error))
+            {
+                MessageBox(hwnd, "删除 Profile 失败：\n" + error, "删除 Profile",
+                    0x00000010 /* MB_ICONERROR */ | 0x00000000 /* MB_OK */);
+                return;
+            }
+            QueueNotification("DeepSeek Harness", "Profile " + name + " 已删除。");
+        }
+
+        /// <summary>
+        /// Skinned modal dialog listing the existing profiles; the one in use
+        /// is shown disabled and cannot be chosen. Returns the selected profile
+        /// name, or null when cancelled.
+        /// </summary>
+        private static string ShowDeleteProfileDialog()
+        {
+            List<string> profiles = core.GetAvailableProfiles();
+            int rows = Math.Min(profiles.Count, DeleteProfileMaxRows);
+
+            if (deleteProfileHwnd == IntPtr.Zero)
+            {
+                const int width = 460;
+                int height = 138 + 32 * rows + 64; // title+list+error+buttons
+                int x = Math.Max(0, (GetSystemMetrics(SM_CXSCREEN) - width) / 2);
+                int y = Math.Max(0, (GetSystemMetrics(SM_CYSCREEN) - height) / 3);
+                IntPtr hInstance = GetModuleHandle(null);
+                deleteProfileHwnd = CreateWindowEx(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, ClassName,
+                    "删除 Profile", WS_CAPTION | WS_SYSMENU,
+                    x, y, width, height, IntPtr.Zero, IntPtr.Zero, hInstance, IntPtr.Zero);
+                if (deleteProfileHwnd == IntPtr.Zero) return null;
+                SendMessage(deleteProfileHwnd, 0x0080, (IntPtr)1, hIcon); // WM_SETICON / ICON_BIG
+                RefreshSystemTheme();
+                if (promptTitleFont == IntPtr.Zero) promptTitleFont = CreateUiFont(-22, 600, "Microsoft YaHei UI");
+                if (promptBodyFont == IntPtr.Zero) promptBodyFont = CreateUiFont(-13, 400, "Microsoft YaHei UI");
+            }
+
+            deleteProfileNames.Clear();
+            deleteProfileNames.AddRange(profiles);
+            deleteProfileSelected = -1;
+            deleteProfileHover = -1;
+            deleteProfileResult = -1;
+            deleteProfileError = null;
+            hoveredDeleteButton = 0;
+            pressedDeleteButton = 0;
+            InvalidateRect(deleteProfileHwnd, IntPtr.Zero, false);
+            ShowWindow(deleteProfileHwnd, SW_SHOW);
+            SetForegroundWindow(deleteProfileHwnd);
+
+            MSG msg;
+            while (deleteProfileResult == -1 && GetMessage(out msg, IntPtr.Zero, 0, 0) > 0)
+            {
+                TranslateMessage(ref msg);
+                DispatchMessage(ref msg);
+            }
+
+            ShowWindow(deleteProfileHwnd, SW_HIDE);
+            if (deleteProfileResult != 0 || deleteProfileSelected < 0
+                || deleteProfileSelected >= deleteProfileNames.Count) return null;
+            return deleteProfileNames[deleteProfileSelected];
+        }
+
+        private static RECT GetDeleteListRect()
+        {
+            RECT client;
+            GetClientRect(deleteProfileHwnd, out client);
+            return new RECT(24, 82, client.Right - 24, client.Bottom - 84);
+        }
+
+        private static int HitTestDeleteList(int x, int y)
+        {
+            RECT list = GetDeleteListRect();
+            const int rowH = 32;
+            int row = (y - list.Top) / rowH;
+            if (y < list.Top || row < 0 || row >= deleteProfileNames.Count) return -1;
+            if (x < list.Left || x >= list.Right) return -1;
+            return row;
+        }
+
+        private static RECT GetDeleteOkRect(RECT client)
+        {
+            return new RECT(client.Right - 144, client.Bottom - 56, client.Right - 24, client.Bottom - 20);
+        }
+
+        private static RECT GetDeleteCancelRect(RECT client)
+        {
+            return new RECT(client.Right - 274, client.Bottom - 56, client.Right - 154, client.Bottom - 20);
+        }
+
+        private static int GetDeleteButtonAt(int x, int y)
+        {
+            RECT client;
+            GetClientRect(deleteProfileHwnd, out client);
+            if (PointInRect(GetDeleteOkRect(client), x, y)) return 1;
+            if (PointInRect(GetDeleteCancelRect(client), x, y)) return 2;
+            return 0;
+        }
+
+        private static void PaintDeleteProfileDialog()
+        {
+            PAINTSTRUCT paint;
+            IntPtr target = BeginPaint(deleteProfileHwnd, out paint);
+            if (target == IntPtr.Zero) return;
+
+            RECT client;
+            GetClientRect(deleteProfileHwnd, out client);
+            IntPtr buffer = CreateCompatibleDC(target);
+            IntPtr bitmap = CreateCompatibleBitmap(target, client.Right, client.Bottom);
+            IntPtr oldBitmap = SelectObject(buffer, bitmap);
+
+            int background = useDarkTheme ? Rgb(31, 33, 36) : Rgb(250, 251, 252);
+            int heading = useDarkTheme ? Rgb(242, 244, 246) : Rgb(24, 29, 35);
+            int secondary = useDarkTheme ? Rgb(169, 176, 184) : Rgb(91, 99, 108);
+            int dimColor = useDarkTheme ? Rgb(108, 114, 122) : Rgb(150, 156, 163);
+            int errorColor = useDarkTheme ? Rgb(240, 122, 122) : Rgb(190, 60, 60);
+            int hoverColor = useDarkTheme ? Rgb(45, 49, 54) : Rgb(232, 235, 238);
+            int accent = useDarkTheme ? Rgb(45, 169, 151) : Rgb(23, 126, 113);
+            int danger = useDarkTheme ? Rgb(200, 72, 72) : Rgb(178, 52, 52);
+            int dangerHover = useDarkTheme ? Rgb(220, 88, 88) : Rgb(198, 62, 62);
+            int dangerPressed = useDarkTheme ? Rgb(172, 58, 58) : Rgb(148, 40, 40);
+            FillColor(buffer, client, background);
+
+            RECT titleRect = new RECT(24, 20, client.Right - 24, 52);
+            DrawLabel(buffer, "删除 Profile", titleRect, promptTitleFont, heading,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+            RECT hintRect = new RECT(24, 56, client.Right - 24, 78);
+            DrawLabel(buffer, "选择要删除的 Profile（当前使用的不可删除）：", hintRect,
+                promptBodyFont, secondary, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+            // Profile rows.
+            RECT list = GetDeleteListRect();
+            const int rowH = 32;
+            for (int i = 0; i < deleteProfileNames.Count && i < DeleteProfileMaxRows; i++)
+            {
+                RECT row = new RECT(list.Left, list.Top + i * rowH, list.Right, list.Top + (i + 1) * rowH);
+                bool inUse = string.Equals(deleteProfileNames[i], core.DshProfile, StringComparison.Ordinal);
+                bool hovered = i == deleteProfileHover && !inUse;
+                if (hovered || i == deleteProfileSelected)
+                {
+                    RECT hl = new RECT(row.Left, row.Top + 2, row.Right, row.Bottom - 2);
+                    FillRounded(buffer, hl, 6, i == deleteProfileSelected && !inUse
+                        ? (useDarkTheme ? Rgb(41, 72, 67) : Rgb(213, 235, 230))
+                        : hoverColor);
+                }
+                if (i == deleteProfileSelected && !inUse)
+                {
+                    RECT dot = new RECT(row.Left + 8, row.Top + rowH / 2 - 3, row.Left + 14, row.Top + rowH / 2 + 3);
+                    FillRounded(buffer, dot, 3, accent);
+                }
+
+                RECT textRect = new RECT(row.Left + 24, row.Top, row.Right - 10, row.Bottom);
+                DrawLabel(buffer, deleteProfileNames[i], textRect, promptBodyFont,
+                    inUse ? dimColor : secondary,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+                if (inUse)
+                {
+                    RECT tagRect = new RECT(row.Right - 92, row.Top, row.Right - 10, row.Bottom);
+                    DrawLabel(buffer, "使用中", tagRect, promptBodyFont, accent,
+                        DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                }
+            }
+
+            RECT errorRect = new RECT(24, list.Bottom + 4, client.Right - 24, list.Bottom + 26);
+            if (!string.IsNullOrEmpty(deleteProfileError))
+            {
+                DrawLabel(buffer, deleteProfileError, errorRect, promptBodyFont, errorColor,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+            }
+
+            RECT okRect = GetDeleteOkRect(client);
+            int okColor = pressedDeleteButton == 1 ? dangerPressed
+                : hoveredDeleteButton == 1 ? dangerHover : danger;
+            FillRounded(buffer, okRect, 6, okColor);
+            DrawLabel(buffer, "删除", okRect, promptBodyFont, Rgb(255, 255, 255),
+                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | 0x0001);
+
+            RECT cancelRect = GetDeleteCancelRect(client);
+            int cancelColor = useDarkTheme
+                ? (pressedDeleteButton == 2 ? Rgb(83, 89, 96)
+                    : hoveredDeleteButton == 2 ? Rgb(70, 76, 82) : Rgb(55, 60, 66))
+                : (pressedDeleteButton == 2 ? Rgb(205, 211, 216)
+                    : hoveredDeleteButton == 2 ? Rgb(218, 223, 227) : Rgb(232, 235, 238));
+            FillRounded(buffer, cancelRect, 6, cancelColor);
+            DrawLabel(buffer, "取消", cancelRect, promptBodyFont,
+                useDarkTheme ? Rgb(242, 244, 246) : Rgb(38, 44, 51),
+                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | 0x0001);
+
+            BitBlt(target, 0, 0, client.Right, client.Bottom, buffer, 0, 0, SRCCOPY);
+            SelectObject(buffer, oldBitmap);
+            DeleteObject(bitmap);
+            DeleteDC(buffer);
+            EndPaint(deleteProfileHwnd, ref paint);
         }
 
         private static RECT GetCreateOkRect(RECT client)
@@ -2005,6 +2340,11 @@ namespace DshTray
                 DestroyWindow(createProfileHwnd);
                 createProfileHwnd = IntPtr.Zero;
                 createProfileEditHwnd = IntPtr.Zero;
+            }
+            if (deleteProfileHwnd != IntPtr.Zero)
+            {
+                DestroyWindow(deleteProfileHwnd);
+                deleteProfileHwnd = IntPtr.Zero;
             }
             DestroyCreateEditBrush();
             if (menuMainHwnd != IntPtr.Zero)

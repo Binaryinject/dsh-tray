@@ -572,7 +572,44 @@ namespace DshTray
             }
         }
 
-        /// <summary>Human-readable "dsh &lt;version&gt; · &lt;branch&gt;" line for the tray menu.</summary>
+        /// <summary>
+        /// Delete a profile directory (with its plugins and configuration).
+        /// The profile currently in use cannot be deleted — switch to another
+        /// profile first. Deleting the built-in "web" is allowed, because dsh
+        /// re-initializes it from its template on the next boot. Returns false
+        /// with an error message on failure.
+        /// </summary>
+        public bool DeleteProfile(string name, out string error)
+        {
+            error = null;
+            if (!AppSettings.IsValidProfileName(name))
+            {
+                error = "名称无效。";
+                return false;
+            }
+            string dir = ProfileDirectory(name);
+            if (!Directory.Exists(dir))
+            {
+                error = "Profile \"" + name + "\" 不存在。";
+                return false;
+            }
+            if (string.Equals(name, dshProfile, StringComparison.Ordinal))
+            {
+                error = "当前正在使用的 Profile 不能删除，请先切换到其他 Profile。";
+                return false;
+            }
+            try
+            {
+                Directory.Delete(dir, true);
+                Log("[profile] deleted " + name);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
         public string DshVersionDisplay
         {
             get

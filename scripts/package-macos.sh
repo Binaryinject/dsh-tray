@@ -1,10 +1,10 @@
-#!/bin/bash
+﻿#!/bin/bash
 # Package the macOS build into a .app bundle and a DMG.
 # Usage: package-macos.sh <rid> <version>
 set -euo pipefail
 
 RID="$1"
-VERSION="${2:-0.1.16}"
+VERSION="${2:-0.1.17}"
 
 BASE="bin/Release/net10.0-macos"
 APP="dsh-tray.app"
@@ -53,7 +53,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# 3. Icon (.icns) from the high-res master — best effort, never fatal
+# 3. Icon (.icns) from the high-res master 鈥?best effort, never fatal
 mkdir -p "$APP/Contents/Resources"
 (
   set +e

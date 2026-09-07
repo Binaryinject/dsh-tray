@@ -76,6 +76,7 @@ dsh-tray --stop           请求正在运行的实例停止
 
 - 菜单会列出所有已存在的 profile 目录（带 `package.json`），勾选当前使用的那个
 - 点击「创建 Profile…」输入名称后，dsh-tray 会在 `$DSH_HOME/profiles/` 下创建新的 web 型 profile（dsh-base + dsh-web-app，实时应用 patch），并自动切换、重启服务
+- 点击「删除 Profile…」可选择并删除一个 profile（连同其插件与配置）；当前正在使用的 profile 不能删除，需先切换到其它 profile
 - 名称仅允许字母、数字、`-`、`_`、`.` 且以字母或数字开头；`desktop` 与 `node_modules` 为保留名
 - 切换 Profile 后托盘会保存选择，之后启动的 dsh 服务都使用该 profile；控制台里的 `dsh plugin --profile ...` 提示也会跟随当前 profile
 - 新 profile 为空配置，如需安装插件，使用控制台中的 `dsh plugin --profile <名称> add <包名>`（依赖 pnpm）

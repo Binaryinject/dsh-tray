@@ -196,6 +196,7 @@ namespace DshTray
             }
             profileMenu.AddItem(NSMenuItem.SeparatorItem);
             profileMenu.AddItem(MakeItem("创建 Profile…", "createProfile:", actions));
+            profileMenu.AddItem(MakeItem("删除 Profile…", "deleteProfile:", actions));
 
             if (profileParentItem != null)
                 profileParentItem.Title = "Profile（当前：" + core.DshProfile + "）";
@@ -569,6 +570,56 @@ namespace DshTray
                 core.SetDshProfile(name);
                 RefreshProfileMenu();
                 NotifyToWindow("Profile " + name + " 已创建并切换。");
+            }
+
+            [Export("deleteProfile:")]
+            public void DeleteProfile(NSObject sender)
+            {
+                System.Collections.Generic.List<string> profiles = core.GetAvailableProfiles();
+                if (profiles.Count == 0) return;
+
+                NSAlert alert = new NSAlert();
+                alert.MessageText = "删除 Profile";
+                alert.InformativeText = "选择要删除的 Profile（当前使用的不可删除）：";
+                NSPopUpButton popup = new NSPopUpButton(new CGRect(0, 0, 240, 26), true);
+                for (int i = 0; i < profiles.Count; i++)
+                {
+                    popup.AddItem(profiles[i]);
+                    if (string.Equals(profiles[i], core.DshProfile, StringComparison.Ordinal))
+                    {
+                        // The profile in use is listed for context, but disabled.
+                        NSMenuItem item = popup.LastItem;
+                        if (item != null) item.Enabled = false;
+                    }
+                }
+                alert.AccessoryView = popup;
+                alert.AddButton("删除");
+                alert.AddButton("取消");
+                long result = (long)alert.RunModal();
+                if (result != 1000 || string.Equals(popup.TitleOfSelectedItem ?? "", core.DshProfile, StringComparison.Ordinal))
+                    return;
+
+                string name = popup.TitleOfSelectedItem;
+                if (string.IsNullOrEmpty(name)) return;
+
+                NSAlert confirm = new NSAlert();
+                confirm.MessageText = "确定删除";
+                confirm.InformativeText = "确定删除 Profile「" + name + "」吗？\n将删除该 Profile 的全部插件与配置，操作不可恢复。";
+                confirm.AddButton("删除");
+                confirm.AddButton("取消");
+                if ((long)confirm.RunModal() != 1000) return;
+
+                string error;
+                if (!core.DeleteProfile(name, out error))
+                {
+                    NSAlert failed = new NSAlert();
+                    failed.MessageText = "删除 Profile 失败";
+                    failed.InformativeText = error ?? "未知错误";
+                    failed.RunModal();
+                    return;
+                }
+                RefreshProfileMenu();
+                NotifyToWindow("Profile " + name + " 已删除。");
             }
 
             [Export("quit:")]
