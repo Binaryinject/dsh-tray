@@ -15,6 +15,7 @@ namespace DshTray
     {
         private const uint WM_NULL = 0x0000;
         private const uint WM_DESTROY = 0x0002;
+        private const uint WM_SIZE = 0x0005;
         private const uint WM_ACTIVATE = 0x0006;
         private const uint WM_PAINT = 0x000F;
         private const uint WM_CLOSE = 0x0010;
@@ -134,19 +135,14 @@ namespace DshTray
         private const int LogWindowHideCompletedMs = 2000;
         private const int LogWindowHideNotifyMs = 6000;
 
-        // ---- Log viewer window state (self-drawn, streaming tail read) ----
+        // ---- Log viewer window state (self-drawn shell + native EDIT content) ----
         private static IntPtr logViewerHwnd;
+        private static IntPtr logViewerEditHwnd;
+        private static IntPtr viewerEditBrush;
         private static readonly List<string> viewerLines = new List<string>();
-        private static int viewerScrollOffset;  // rows scrolled up from the newest line
-        private static int viewerMaxScroll;
-        private static bool viewerDragging;
-        private static int viewerDragStartY;
-        private static int viewerDragStartOffset;
         private static int viewerButtonHover;
         private static int viewerButtonPressed;
         private const int ViewerMaxLines = 8000;
-        private const int ViewerLineHeight = 18;
-        private const uint WM_MOUSEWHEEL = 0x020A;
         private static int updatePromptResult = -1;
         private static int hoveredPromptButton;
         private static int pressedPromptButton;
@@ -169,6 +165,17 @@ namespace DshTray
         private static int hoveredDeleteButton;
         private static int pressedDeleteButton;
         private static string deleteProfileError;
+
+        // ---- Generic skinned confirm/info dialog ----
+        private static IntPtr skinDialogHwnd;
+        private static int skinDialogResult = -1;
+        private static string skinDialogTitle;
+        private static string skinDialogBody;
+        private static string skinDialogOkText;
+        private static string skinDialogCancelText;
+        private static bool skinDialogDanger;
+        private static int skinDialogHover;
+        private static int skinDialogPressed;
 
         // ---- Skinned popup menu state ----
         private sealed class MenuItemData
@@ -461,6 +468,86 @@ namespace DshTray
                 return IntPtr.Zero;
             }
 
+            if (hWnd == skinDialogHwnd && msg == WM_CLOSE)
+            {
+                skinDialogResult = 0;
+                ShowWindow(skinDialogHwnd, SW_HIDE);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == skinDialogHwnd && msg == WM_KEYDOWN && wParam.ToInt32() == 0x1B)
+            {
+                skinDialogResult = 0;
+                ShowWindow(skinDialogHwnd, SW_HIDE);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == skinDialogHwnd && msg == WM_LBUTTONUP)
+            {
+                int x = (short)((long)lParam & 0xffff);
+                int y = (short)(((long)lParam >> 16) & 0xffff);
+                int button = GetSkinButtonAt(x, y);
+                int clicked = skinDialogPressed == button ? button : 0;
+                skinDialogPressed = 0;
+                ReleaseCapture();
+                InvalidateRect(skinDialogHwnd, IntPtr.Zero, false);
+                if (clicked == 1) skinDialogResult = 1;
+                else if (clicked == 2) skinDialogResult = 0;
+                if (skinDialogResult != -1) ShowWindow(skinDialogHwnd, SW_HIDE);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == skinDialogHwnd && msg == WM_LBUTTONDOWN)
+            {
+                int x = (short)((long)lParam & 0xffff);
+                int y = (short)(((long)lParam >> 16) & 0xffff);
+                skinDialogPressed = GetSkinButtonAt(x, y);
+                if (skinDialogPressed != 0) SetCapture(skinDialogHwnd);
+                InvalidateRect(skinDialogHwnd, IntPtr.Zero, false);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == skinDialogHwnd && msg == WM_MOUSEMOVE)
+            {
+                int x = (short)((long)lParam & 0xffff);
+                int y = (short)(((long)lParam >> 16) & 0xffff);
+                int button = GetSkinButtonAt(x, y);
+                if (button != skinDialogHover)
+                {
+                    skinDialogHover = button;
+                    InvalidateRect(skinDialogHwnd, IntPtr.Zero, false);
+                }
+                if (button != 0) SetCursor(LoadCursor(IntPtr.Zero, (IntPtr)IDC_HAND));
+                TRACKMOUSEEVENT tracking = new TRACKMOUSEEVENT();
+                tracking.cbSize = (uint)Marshal.SizeOf<TRACKMOUSEEVENT>();
+                tracking.dwFlags = TME_LEAVE;
+                tracking.hwndTrack = skinDialogHwnd;
+                TrackMouseEvent(ref tracking);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == skinDialogHwnd && msg == WM_MOUSELEAVE)
+            {
+                skinDialogHover = 0;
+                if (skinDialogPressed == 0) InvalidateRect(skinDialogHwnd, IntPtr.Zero, false);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == skinDialogHwnd && msg == WM_PAINT)
+            {
+                PaintSkinDialog();
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == skinDialogHwnd && msg == WM_ERASEBKGND) return (IntPtr)1;
+
+            if (hWnd == skinDialogHwnd && msg == WM_SETTINGCHANGE)
+            {
+                RefreshSystemTheme();
+                InvalidateRect(skinDialogHwnd, IntPtr.Zero, false);
+                return IntPtr.Zero;
+            }
+
             if (hWnd == createProfileHwnd && msg == WM_CLOSE)
             {
                 createProfileResult = 1;
@@ -699,71 +786,25 @@ namespace DshTray
                 return IntPtr.Zero;
             }
 
-            if (hWnd == logViewerHwnd && msg == WM_KEYDOWN)
+            if (hWnd == logViewerHwnd && msg == WM_SIZE)
             {
-                int vk = wParam.ToInt32();
-                RECT client;
-                GetClientRect(logViewerHwnd, out client);
-                RECT logRect = GetViewerLogRect(client);
-                int visible = GetViewerVisibleRows(logRect);
-                if (vk == 0x26) viewerScrollOffset += 1;          // up
-                else if (vk == 0x28) viewerScrollOffset -= 1;     // down
-                else if (vk == 0x21) viewerScrollOffset += visible; // page up
-                else if (vk == 0x22) viewerScrollOffset -= visible; // page down
-                else if (vk == 0x24) viewerScrollOffset = viewerMaxScroll; // home
-                else if (vk == 0x23) viewerScrollOffset = 0;      // end
-                else return DefWindowProc(hWnd, msg, wParam, lParam);
-                if (viewerScrollOffset < 0) viewerScrollOffset = 0;
-                if (viewerScrollOffset > viewerMaxScroll) viewerScrollOffset = viewerMaxScroll;
+                LayoutLogViewerEdit();
                 InvalidateRect(logViewerHwnd, IntPtr.Zero, false);
                 return IntPtr.Zero;
             }
 
-            if (hWnd == logViewerHwnd && msg == WM_MOUSEWHEEL)
+            if (hWnd == logViewerHwnd && msg == WM_CTLCOLOREDIT)
             {
-                int delta = (short)((long)wParam >> 16);
-                viewerScrollOffset += (delta / 120) * 3;
-                if (viewerScrollOffset < 0) viewerScrollOffset = 0;
-                if (viewerScrollOffset > viewerMaxScroll) viewerScrollOffset = viewerMaxScroll;
-                InvalidateRect(logViewerHwnd, IntPtr.Zero, false);
-                return IntPtr.Zero;
+                // Hacker-terminal style: pure black background + matrix green.
+                SetTextColor(wParam, useDarkTheme ? Rgb(0, 255, 65) : Rgb(15, 107, 47));
+                SetBkColor(wParam, (uint)(useDarkTheme ? Rgb(0, 0, 0) : Rgb(255, 255, 255)));
+                return EnsureViewerEditBrush();
             }
 
             if (hWnd == logViewerHwnd && msg == WM_LBUTTONDOWN)
             {
                 int x = (short)((long)lParam & 0xffff);
                 int y = (short)(((long)lParam >> 16) & 0xffff);
-
-                RECT client;
-                GetClientRect(logViewerHwnd, out client);
-                RECT logRect = GetViewerLogRect(client);
-                int trackTop, trackBottom, trackX, trackW, thumbTop, thumbH;
-                GetViewerScrollbarGeometry(logRect, out trackTop, out trackBottom,
-                    out trackX, out trackW, out thumbTop, out thumbH);
-
-                bool inThumb = x >= trackX && x < trackX + trackW
-                    && y >= thumbTop && y < thumbTop + thumbH;
-                if (inThumb)
-                {
-                    viewerDragging = true;
-                    viewerDragStartY = y;
-                    viewerDragStartOffset = viewerScrollOffset;
-                    SetCapture(logViewerHwnd);
-                    return IntPtr.Zero;
-                }
-                bool inTrack = x >= trackX && x < trackX + trackW
-                    && y >= trackTop && y < trackBottom;
-                if (inTrack)
-                {
-                    int visible = GetViewerVisibleRows(logRect);
-                    if (y < thumbTop) viewerScrollOffset += visible;
-                    else viewerScrollOffset -= visible;
-                    if (viewerScrollOffset < 0) viewerScrollOffset = 0;
-                    if (viewerScrollOffset > viewerMaxScroll) viewerScrollOffset = viewerMaxScroll;
-                    InvalidateRect(logViewerHwnd, IntPtr.Zero, false);
-                    return IntPtr.Zero;
-                }
-
                 viewerButtonPressed = GetViewerButtonAt(x, y);
                 if (viewerButtonPressed != 0) SetCapture(logViewerHwnd);
                 InvalidateRect(logViewerHwnd, IntPtr.Zero, false);
@@ -774,11 +815,6 @@ namespace DshTray
             {
                 int x = (short)((long)lParam & 0xffff);
                 int y = (short)(((long)lParam >> 16) & 0xffff);
-                if (viewerDragging)
-                {
-                    ViewerSetScrollFromDrag(y);
-                    return IntPtr.Zero;
-                }
                 int button = GetViewerButtonAt(x, y);
                 if (button != viewerButtonHover)
                 {
@@ -798,12 +834,6 @@ namespace DshTray
             {
                 int x = (short)((long)lParam & 0xffff);
                 int y = (short)(((long)lParam >> 16) & 0xffff);
-                if (viewerDragging)
-                {
-                    viewerDragging = false;
-                    ReleaseCapture();
-                    return IntPtr.Zero;
-                }
                 int button = GetViewerButtonAt(x, y);
                 int clicked = viewerButtonPressed == button ? button : 0;
                 viewerButtonPressed = 0;
@@ -832,6 +862,7 @@ namespace DshTray
             if (hWnd == logViewerHwnd && msg == WM_SETTINGCHANGE)
             {
                 RefreshSystemTheme();
+                DestroyViewerEditBrush();
                 InvalidateRect(logViewerHwnd, IntPtr.Zero, false);
                 return IntPtr.Zero;
             }
@@ -1710,20 +1741,160 @@ namespace DshTray
             string name = ShowDeleteProfileDialog();
             if (string.IsNullOrEmpty(name)) return;
 
-            int answer = MessageBox(hwnd,
-                "确定删除 Profile「" + name + "」吗？\n将删除该 Profile 的全部插件与配置，操作不可恢复。",
+            bool confirmed = ShowSkinConfirm(
                 "删除 Profile",
-                0x00000004 /* MB_YESNO */ | 0x00000030 /* MB_ICONWARNING */);
-            if (answer != 6 /* IDYES */) return;
+                "确定删除 Profile「" + name + "」吗？\n将删除该 Profile 的全部插件与配置，操作不可恢复。",
+                "删除", "取消", true);
+            if (!confirmed) return;
 
             string error;
             if (!core.DeleteProfile(name, out error))
             {
-                MessageBox(hwnd, "删除 Profile 失败：\n" + error, "删除 Profile",
-                    0x00000010 /* MB_ICONERROR */ | 0x00000000 /* MB_OK */);
+                ShowSkinConfirm("删除 Profile",
+                    "删除失败：\n" + error,
+                    "知道了", null, false);
                 return;
             }
             QueueNotification("DSH Tray", "Profile " + name + " 已删除。");
+        }
+
+        /// <summary>
+        /// Skinned modal confirm/info dialog (replaces system MessageBox).
+        /// Returns true when the primary button was clicked, false otherwise
+        /// (cancel, close, Esc).
+        /// </summary>
+        private static bool ShowSkinConfirm(string title, string body,
+            string okText, string cancelText, bool danger)
+        {
+            string[] bodyLines = (body ?? "").Split('\n');
+            int lineCount = Math.Max(1, Math.Min(bodyLines.Length, 5));
+
+            if (skinDialogHwnd == IntPtr.Zero)
+            {
+                const int width = 460;
+                int height = 118 + lineCount * 18 + 64;
+                int x = Math.Max(0, (GetSystemMetrics(SM_CXSCREEN) - width) / 2);
+                int y = Math.Max(0, (GetSystemMetrics(SM_CYSCREEN) - height) / 3);
+                IntPtr hInstance = GetModuleHandle(null);
+                skinDialogHwnd = CreateWindowEx(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, ClassName,
+                    title, WS_CAPTION | WS_SYSMENU,
+                    x, y, width, height, IntPtr.Zero, IntPtr.Zero, hInstance, IntPtr.Zero);
+                if (skinDialogHwnd == IntPtr.Zero) return false;
+                SendMessage(skinDialogHwnd, 0x0080, (IntPtr)1, hIcon); // WM_SETICON / ICON_BIG
+                RefreshSystemTheme();
+                if (promptTitleFont == IntPtr.Zero) promptTitleFont = CreateUiFont(-22, 600, "Microsoft YaHei UI");
+                if (promptBodyFont == IntPtr.Zero) promptBodyFont = CreateUiFont(-13, 400, "Microsoft YaHei UI");
+            }
+
+            skinDialogTitle = title;
+            skinDialogBody = body;
+            skinDialogOkText = okText ?? "确定";
+            skinDialogCancelText = cancelText;
+            skinDialogDanger = danger;
+            skinDialogResult = -1;
+            skinDialogHover = 0;
+            skinDialogPressed = 0;
+            InvalidateRect(skinDialogHwnd, IntPtr.Zero, false);
+            ShowWindow(skinDialogHwnd, SW_SHOW);
+            SetForegroundWindow(skinDialogHwnd);
+
+            MSG msg;
+            while (skinDialogResult == -1 && GetMessage(out msg, IntPtr.Zero, 0, 0) > 0)
+            {
+                TranslateMessage(ref msg);
+                DispatchMessage(ref msg);
+            }
+
+            ShowWindow(skinDialogHwnd, SW_HIDE);
+            return skinDialogResult == 1;
+        }
+
+        private static RECT GetSkinOkRect(RECT client)
+        {
+            return new RECT(client.Right - 144, client.Bottom - 56, client.Right - 24, client.Bottom - 20);
+        }
+
+        private static RECT GetSkinCancelRect(RECT client)
+        {
+            return new RECT(client.Right - 274, client.Bottom - 56, client.Right - 154, client.Bottom - 20);
+        }
+
+        private static int GetSkinButtonAt(int x, int y)
+        {
+            RECT client;
+            GetClientRect(skinDialogHwnd, out client);
+            if (PointInRect(GetSkinOkRect(client), x, y)) return 1;
+            if (string.IsNullOrEmpty(skinDialogCancelText)) return 0;
+            if (PointInRect(GetSkinCancelRect(client), x, y)) return 2;
+            return 0;
+        }
+
+        private static void PaintSkinDialog()
+        {
+            PAINTSTRUCT paint;
+            IntPtr target = BeginPaint(skinDialogHwnd, out paint);
+            if (target == IntPtr.Zero) return;
+
+            RECT client;
+            GetClientRect(skinDialogHwnd, out client);
+            IntPtr buffer = CreateCompatibleDC(target);
+            IntPtr bitmap = CreateCompatibleBitmap(target, client.Right, client.Bottom);
+            IntPtr oldBitmap = SelectObject(buffer, bitmap);
+
+            int background = useDarkTheme ? Rgb(31, 33, 36) : Rgb(250, 251, 252);
+            int heading = useDarkTheme ? Rgb(242, 244, 246) : Rgb(24, 29, 35);
+            int secondary = useDarkTheme ? Rgb(169, 176, 184) : Rgb(91, 99, 108);
+            int accent = useDarkTheme ? Rgb(45, 169, 151) : Rgb(23, 126, 113);
+            int danger = useDarkTheme ? Rgb(200, 72, 72) : Rgb(178, 52, 52);
+            int dangerHover = useDarkTheme ? Rgb(220, 88, 88) : Rgb(198, 62, 62);
+            int dangerPressed = useDarkTheme ? Rgb(172, 58, 58) : Rgb(148, 40, 40);
+            FillColor(buffer, client, background);
+
+            RECT titleRect = new RECT(24, 20, client.Right - 24, 52);
+            DrawLabel(buffer, skinDialogTitle ?? "", titleRect, promptTitleFont, heading,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+            string[] bodyLines = (skinDialogBody ?? "").Split('\n');
+            float by = 72;
+            int maxLines = Math.Min(bodyLines.Length, 5);
+            for (int i = 0; i < maxLines; i++)
+            {
+                if (bodyLines[i].Length == 0) { by += 6; continue; }
+                RECT lineRect = new RECT(24, (int)by, client.Right - 24, (int)by + 20);
+                DrawLabel(buffer, bodyLines[i], lineRect, promptBodyFont, secondary,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+                by += 18;
+            }
+
+            RECT okRect = GetSkinOkRect(client);
+            int okColor = skinDialogPressed == 1
+                ? (skinDialogDanger ? dangerPressed : Rgb(12, 91, 82))
+                : skinDialogHover == 1
+                    ? (skinDialogDanger ? dangerHover : Rgb(15, 110, 99))
+                    : (skinDialogDanger ? danger : accent);
+            FillRounded(buffer, okRect, 6, okColor);
+            DrawLabel(buffer, skinDialogOkText ?? "确定", okRect, promptBodyFont, Rgb(255, 255, 255),
+                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | 0x0001);
+
+            if (!string.IsNullOrEmpty(skinDialogCancelText))
+            {
+                RECT cancelRect = GetSkinCancelRect(client);
+                int cancelColor = useDarkTheme
+                    ? (skinDialogPressed == 2 ? Rgb(83, 89, 96)
+                        : skinDialogHover == 2 ? Rgb(70, 76, 82) : Rgb(55, 60, 66))
+                    : (skinDialogPressed == 2 ? Rgb(205, 211, 216)
+                        : skinDialogHover == 2 ? Rgb(218, 223, 227) : Rgb(232, 235, 238));
+                FillRounded(buffer, cancelRect, 6, cancelColor);
+                DrawLabel(buffer, skinDialogCancelText, cancelRect, promptBodyFont,
+                    useDarkTheme ? Rgb(242, 244, 246) : Rgb(38, 44, 51),
+                    DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | 0x0001);
+            }
+
+            BitBlt(target, 0, 0, client.Right, client.Bottom, buffer, 0, 0, SRCCOPY);
+            SelectObject(buffer, oldBitmap);
+            DeleteObject(bitmap);
+            DeleteDC(buffer);
+            EndPaint(skinDialogHwnd, ref paint);
         }
 
         /// <summary>
@@ -2552,6 +2723,7 @@ namespace DshTray
             LoadViewerTail();
             ShowWindow(logViewerHwnd, SW_SHOW);
             SetForegroundWindow(logViewerHwnd);
+            if (logViewerEditHwnd != IntPtr.Zero) SetFocus(logViewerEditHwnd);
         }
 
         private static void EnsureLogViewer()
@@ -2564,7 +2736,9 @@ namespace DshTray
             int y = Math.Max(0, (GetSystemMetrics(SM_CYSCREEN) - height) / 3);
             IntPtr hInstance = GetModuleHandle(null);
             logViewerHwnd = CreateWindowEx(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, ClassName,
-                "DSH Tray 日志", WS_CAPTION | WS_SYSMENU,
+                "DSH Tray 日志",
+                WS_CAPTION | WS_SYSMENU | 0x00040000 /* WS_THICKFRAME */
+                | 0x00010000 /* WS_MAXIMIZEBOX */ | 0x00020000 /* WS_MINIMIZEBOX */,
                 x, y, width, height, IntPtr.Zero, IntPtr.Zero, hInstance, IntPtr.Zero);
             if (logViewerHwnd == IntPtr.Zero) return;
             SendMessage(logViewerHwnd, 0x0080, (IntPtr)1, hIcon); // WM_SETICON / ICON_BIG
@@ -2572,53 +2746,86 @@ namespace DshTray
             if (headingFont == IntPtr.Zero) headingFont = CreateUiFont(-22, 600, "Microsoft YaHei UI");
             if (bodyFont == IntPtr.Zero) bodyFont = CreateUiFont(-14, 400, "Microsoft YaHei UI");
             if (logFont == IntPtr.Zero) logFont = CreateUiFont(-13, 400, "Cascadia Mono");
+
+            // Native read-only multi-line EDIT: fluid scrolling (same engine as
+            // notepad), text selection & Ctrl+C / context-menu copy for free.
+            logViewerEditHwnd = CreateWindowEx(0, "EDIT", "",
+                0x40000000 /* WS_CHILD */ | 0x10000000 /* WS_VISIBLE */ | 0x00010000 /* WS_TABSTOP */
+                | 0x0004 /* ES_MULTILINE */ | 0x0800 /* ES_READONLY */ | 0x200000 /* WS_VSCROLL */
+                | 0x0080 /* ES_AUTOHSCROLL */,
+                24, 84, width - 48, height - 154, logViewerHwnd, IntPtr.Zero, hInstance, IntPtr.Zero);
+            if (logViewerEditHwnd != IntPtr.Zero)
+            {
+                SendMessage(logViewerEditHwnd, 0x0030 /* WM_SETFONT */, logFont, new IntPtr(1));
+            }
+            LayoutLogViewerEdit();
+        }
+
+        /// <summary>Reposition the log EDIT child to the current client size.</summary>
+        private static void LayoutLogViewerEdit()
+        {
+            if (logViewerEditHwnd == IntPtr.Zero) return;
+            RECT client;
+            GetClientRect(logViewerHwnd, out client);
+            MoveWindow(logViewerEditHwnd, 24, 84,
+                Math.Max(80, client.Right - 48), Math.Max(80, client.Bottom - 154), false);
         }
 
         private static void LoadViewerTail()
         {
+            if (logViewerEditHwnd == IntPtr.Zero) return;
             viewerLines.Clear();
             viewerLines.AddRange(Core.ReadLogTail(core.ServerLogPath, ViewerMaxLines));
-            RecomputeViewerScroll();
-            InvalidateRect(logViewerHwnd, IntPtr.Zero, false);
-        }
 
-        private static RECT GetViewerLogRect(RECT client)
-        {
-            // Scroll bar occupies the right 22px inside the log area.
-            return new RECT(24, 84, client.Right - 62, client.Bottom - 70);
-        }
+            // Suppress repaints while swapping the buffer so the reload does
+            // not flash between old/new content.
+            SendMessage(logViewerEditHwnd, 0x000B /* WM_SETREDRAW */, IntPtr.Zero, IntPtr.Zero);
 
-        private static int GetViewerVisibleRows(RECT logRect)
-        {
-            return Math.Max(1, (logRect.Bottom - logRect.Top) / ViewerLineHeight);
-        }
+            // Large text goes through EM_SETHANDLE (a GMEM_MOVEABLE block),
+            // the documented way to load big content into an edit control:
+            // WM_SETTEXT caps at 32KB and repeated EM_REPLACESEL is not safe
+            // for huge buffers.
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < viewerLines.Count; i++)
+            {
+                sb.Append(viewerLines[i]).Append("\r\n");
+            }
+            string text = sb.ToString();
+            int byteCount = (text.Length + 1) * 2;
+            IntPtr hMem = LocalAlloc(0x0002 /* LMEM_MOVEABLE */, (IntPtr)byteCount);
+            if (hMem == IntPtr.Zero)
+            {
+                SendMessage(logViewerEditHwnd, 0x000B /* WM_SETREDRAW */, new IntPtr(1), IntPtr.Zero);
+                return;
+            }
+            IntPtr p = LocalLock(hMem);
+            if (p == IntPtr.Zero)
+            {
+                LocalFree(hMem);
+                SendMessage(logViewerEditHwnd, 0x000B /* WM_SETREDRAW */, new IntPtr(1), IntPtr.Zero);
+                return;
+            }
+            try
+            {
+                char[] chars = text.ToCharArray();
+                Marshal.Copy(chars, 0, p, chars.Length);
+                Marshal.WriteInt16(p, chars.Length * 2, 0); // NUL terminator
+            }
+            finally
+            {
+                LocalUnlock(hMem);
+            }
+            // The edit control now owns hMem; never LocalFree it afterwards.
+            SendMessage(logViewerEditHwnd, 0x00BC /* EM_SETHANDLE */, hMem, IntPtr.Zero);
 
-        private static void RecomputeViewerScroll()
-        {
+            // Scroll to the newest line, then repaint once.
+            SendMessage(logViewerEditHwnd, 0x0115 /* WM_VSCROLL */, new IntPtr(7 /* SB_BOTTOM */), IntPtr.Zero);
+            SendMessage(logViewerEditHwnd, 0x000B /* WM_SETREDRAW */, new IntPtr(1), IntPtr.Zero);
+            InvalidateRect(logViewerEditHwnd, IntPtr.Zero, false);
+
             RECT client;
             GetClientRect(logViewerHwnd, out client);
-            RECT logRect = GetViewerLogRect(client);
-            int visible = GetViewerVisibleRows(logRect);
-            viewerMaxScroll = Math.Max(0, viewerLines.Count - visible);
-            if (viewerScrollOffset < 0) viewerScrollOffset = 0;
-            if (viewerScrollOffset > viewerMaxScroll) viewerScrollOffset = viewerMaxScroll;
-        }
-
-        private static void GetViewerScrollbarGeometry(RECT logRect, out int trackTop, out int trackBottom,
-            out int trackX, out int trackW, out int thumbTop, out int thumbH)
-        {
-            trackX = logRect.Right - 14;
-            trackW = 8;
-            trackTop = logRect.Top + 4;
-            trackBottom = logRect.Bottom - 4;
-            int trackH = trackBottom - trackTop;
-            int visible = GetViewerVisibleRows(logRect);
-            int total = viewerLines.Count;
-            thumbH = Math.Max(28, trackH * visible / Math.Max(1, total));
-            if (thumbH > trackH) thumbH = trackH;
-            int range = trackH - thumbH;
-            int offset = viewerMaxScroll > 0 ? viewerScrollOffset : 0;
-            thumbTop = trackTop + (range > 0 ? (int)((long)offset * range / viewerMaxScroll) : 0);
+            InvalidateRect(logViewerHwnd, IntPtr.Zero, false);
         }
 
         private static void PaintLogViewer()
@@ -2636,8 +2843,6 @@ namespace DshTray
             int background = useDarkTheme ? Rgb(31, 33, 36) : Rgb(250, 251, 252);
             int heading = useDarkTheme ? Rgb(242, 244, 246) : Rgb(24, 29, 35);
             int secondary = useDarkTheme ? Rgb(169, 176, 184) : Rgb(91, 99, 108);
-            int logText = useDarkTheme ? Rgb(215, 219, 224) : Rgb(51, 58, 66);
-            int trackColor = useDarkTheme ? Rgb(55, 60, 66) : Rgb(222, 226, 230);
             int accent = useDarkTheme ? Rgb(45, 169, 151) : Rgb(23, 126, 113);
             FillColor(buffer, client, background);
 
@@ -2650,30 +2855,8 @@ namespace DshTray
                 infoRect, bodyFont, secondary,
                 DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
 
-            RECT logRect = GetViewerLogRect(client);
-            RECT logArea = new RECT(logRect.Left, logRect.Top, logRect.Right - 14, logRect.Bottom);
-            int visible = GetViewerVisibleRows(logRect);
-            int total = viewerLines.Count;
-
-            // Paint the visible rows (newest at the bottom when offset == 0).
-            int first = Math.Max(0, total - visible - viewerScrollOffset);
-            for (int i = first; i < total; i++)
-            {
-                RECT lineRect = new RECT(logArea.Left, logArea.Top + (i - first) * ViewerLineHeight,
-                    logArea.Right, logArea.Top + (i - first + 1) * ViewerLineHeight);
-                DrawLabel(buffer, viewerLines[i] ?? string.Empty, lineRect, logFont, logText,
-                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-            }
-
-            // Scroll bar.
-            int trackTop, trackBottom, trackX, trackW, thumbTop, thumbH;
-            GetViewerScrollbarGeometry(logRect, out trackTop, out trackBottom,
-                out trackX, out trackW, out thumbTop, out thumbH);
-            RECT track = new RECT(trackX, trackTop, trackX + trackW, trackBottom);
-            FillRounded(buffer, track, 4, trackColor);
-            RECT thumb = new RECT(trackX, thumbTop, trackX + trackW, thumbTop + thumbH);
-            FillRounded(buffer, thumb, 4, accent);
-
+            // The EDIT child paints the log content itself; the frame behind it
+            // is drawn by the EDIT as well (theme colors via WM_CTLCOLOREDIT).
             RECT refreshRect = GetLogButtonRect(client);
             int refreshColor = useDarkTheme
                 ? (viewerButtonPressed == 1 ? Rgb(83, 89, 96)
@@ -2711,25 +2894,22 @@ namespace DshTray
             return 0;
         }
 
-        /// <summary>Set the scroll offset from a pixel position in the scrollbar thumb area.</summary>
-        private static void ViewerSetScrollFromDrag(int mouseY)
+        private static IntPtr EnsureViewerEditBrush()
         {
-            RECT client;
-            GetClientRect(logViewerHwnd, out client);
-            RECT logRect = GetViewerLogRect(client);
-            int trackTop, trackBottom, trackX, trackW, thumbTop, thumbH;
-            GetViewerScrollbarGeometry(logRect, out trackTop, out trackBottom,
-                out trackX, out trackW, out thumbTop, out thumbH);
-            int range = (trackBottom - trackTop) - thumbH;
-            if (range <= 0) return;
-            int delta = mouseY - viewerDragStartY;
-            int offset = viewerDragStartOffset + (int)((long)delta * viewerMaxScroll / range);
-            if (offset < 0) offset = 0;
-            if (offset > viewerMaxScroll) offset = viewerMaxScroll;
-            if (offset != viewerScrollOffset)
+            if (viewerEditBrush == IntPtr.Zero)
             {
-                viewerScrollOffset = offset;
-                InvalidateRect(logViewerHwnd, IntPtr.Zero, false);
+                // Dark theme: pure black code-editor background.
+                viewerEditBrush = CreateSolidBrush(useDarkTheme ? Rgb(0, 0, 0) : Rgb(255, 255, 255));
+            }
+            return viewerEditBrush;
+        }
+
+        private static void DestroyViewerEditBrush()
+        {
+            if (viewerEditBrush != IntPtr.Zero)
+            {
+                DeleteObject(viewerEditBrush);
+                viewerEditBrush = IntPtr.Zero;
             }
         }
 
@@ -2856,7 +3036,9 @@ namespace DshTray
             {
                 DestroyWindow(logViewerHwnd);
                 logViewerHwnd = IntPtr.Zero;
+                logViewerEditHwnd = IntPtr.Zero;
             }
+            DestroyViewerEditBrush();
             if (updatePromptHwnd != IntPtr.Zero)
             {
                 DestroyWindow(updatePromptHwnd);
@@ -2872,6 +3054,11 @@ namespace DshTray
             {
                 DestroyWindow(deleteProfileHwnd);
                 deleteProfileHwnd = IntPtr.Zero;
+            }
+            if (skinDialogHwnd != IntPtr.Zero)
+            {
+                DestroyWindow(skinDialogHwnd);
+                skinDialogHwnd = IntPtr.Zero;
             }
             DestroyCreateEditBrush();
             if (menuMainHwnd != IntPtr.Zero)
@@ -3077,6 +3264,18 @@ namespace DshTray
 
         [DllImport("user32.dll")]
         private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr LocalAlloc(uint uFlags, IntPtr uBytes);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr LocalLock(IntPtr hMem);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool LocalUnlock(IntPtr hMem);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr LocalFree(IntPtr hMem);
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern bool SetWindowText(IntPtr hWnd, string lpString);
