@@ -40,6 +40,7 @@ namespace DshTray
         private const uint WM_APP_UPDATE_PROGRESS = 0x8006;
         private const uint WM_APP_UPDATE_DONE = 0x8007;
         private const uint WM_APP_UPDATE_FAILED = 0x8008;
+        private const uint WM_APP_LOG = 0x8009;
 
         private const int ID_OPEN = 1001;
         private const int ID_LOG = 1002;
@@ -103,6 +104,7 @@ namespace DshTray
         private static Core core;
         private static IntPtr hwnd;
         private static IntPtr progressHwnd;
+        private static IntPtr logHwnd;
         private static IntPtr updatePromptHwnd;
         private static IntPtr menuMainHwnd;
         private static IntPtr menuSubHwnd;
@@ -117,6 +119,34 @@ namespace DshTray
         private static int progressAnimationOffset;
         private static int hoveredProgressButton;
         private static int pressedProgressButton;
+
+        // ---- Startup/service log window state ----
+        private static readonly List<string> logLines = new List<string>();
+        private const int MaxLogLines = 400;
+        private static string currentLogStage = "服务正在启动…";
+        private static bool logDismissedByUser;
+        private static bool logIsCompleted;
+        private static int hoveredLogButton;
+        private static int pressedLogButton;
+        private static bool logPendingNotify;
+        private static bool logPendingStarted;
+        private static bool logPendingCompleted;
+        private const int LogWindowHideCompletedMs = 2000;
+        private const int LogWindowHideNotifyMs = 6000;
+
+        // ---- Log viewer window state (self-drawn, streaming tail read) ----
+        private static IntPtr logViewerHwnd;
+        private static readonly List<string> viewerLines = new List<string>();
+        private static int viewerScrollOffset;  // rows scrolled up from the newest line
+        private static int viewerMaxScroll;
+        private static bool viewerDragging;
+        private static int viewerDragStartY;
+        private static int viewerDragStartOffset;
+        private static int viewerButtonHover;
+        private static int viewerButtonPressed;
+        private const int ViewerMaxLines = 8000;
+        private const int ViewerLineHeight = 18;
+        private const uint WM_MOUSEWHEEL = 0x020A;
         private static int updatePromptResult = -1;
         private static int hoveredPromptButton;
         private static int pressedPromptButton;
@@ -176,15 +206,9 @@ namespace DshTray
         private static readonly object progressLock = new object();
         private static readonly List<string> progressLogLines = new List<string>();
         private const int MaxProgressLogLines = 400;
-        private static bool pendingProgressNotify;
         private static string pendingStatus;
-        private static string currentStatus = "DeepSeek Harness";
-        private static string pendingProgressStage;
-        private static string pendingProgressDetail;
-        private static bool pendingProgressCompleted;
-        private static bool pendingProgressStarted;
+        private static string currentStatus = "DSH Tray";
         private static bool hasUpdateProgress;
-        private static bool progressDismissedByUser;
         private static readonly object updateLock = new object();
         private static string pendingUpdateTag;
         private static string pendingUpdateDownloadUrl;
@@ -267,7 +291,7 @@ namespace DshTray
             nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
             nid.uCallbackMessage = WM_TRAYICON;
             nid.hIcon = hIcon;
-            nid.szTip = "DeepSeek Harness";
+            nid.szTip = "DSH Tray";
 
             lock (trayLock)
             {
@@ -298,11 +322,11 @@ namespace DshTray
                 int id = (int)((long)wParam & 0xffff);
                 if (id == ID_OPEN) core.OpenBrowser();
                 else if (id == ID_CONSOLE) core.OpenConsole();
-                else if (id == ID_LOG) core.OpenLog();
+                else if (id == ID_LOG) ShowLogViewer();
                 else if (id == ID_PROGRESS)
                 {
-                    progressDismissedByUser = false;
-                    ShowProgressWindow();
+                    logDismissedByUser = false;
+                    ShowLogWindow();
                 }
                 else if (id == ID_RESTART) core.RestartServer();
                 else if (id == ID_BRANCH_LATEST) core.SetDshBranch(AppSettings.LatestBranch);
@@ -328,9 +352,9 @@ namespace DshTray
                 return IntPtr.Zero;
             }
 
-            if (msg == WM_APP_PROGRESS)
+            if (msg == WM_APP_LOG)
             {
-                DrainProgress();
+                DrainLog();
                 return IntPtr.Zero;
             }
 
@@ -648,8 +672,236 @@ namespace DshTray
 
             if (hWnd == progressHwnd && msg == WM_CLOSE)
             {
-                progressDismissedByUser = true;
                 ShowWindow(progressHwnd, SW_HIDE);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == logHwnd && msg == WM_CLOSE)
+            {
+                logDismissedByUser = true;
+                ShowWindow(logHwnd, SW_HIDE);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == logHwnd && msg == WM_TIMER)
+            {
+                if (wParam.ToInt64() == 1)
+                {
+                    KillTimer(logHwnd, (UIntPtr)1);
+                    ShowWindow(logHwnd, SW_HIDE);
+                }
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == logViewerHwnd && msg == WM_CLOSE)
+            {
+                ShowWindow(logViewerHwnd, SW_HIDE);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == logViewerHwnd && msg == WM_KEYDOWN)
+            {
+                int vk = wParam.ToInt32();
+                RECT client;
+                GetClientRect(logViewerHwnd, out client);
+                RECT logRect = GetViewerLogRect(client);
+                int visible = GetViewerVisibleRows(logRect);
+                if (vk == 0x26) viewerScrollOffset += 1;          // up
+                else if (vk == 0x28) viewerScrollOffset -= 1;     // down
+                else if (vk == 0x21) viewerScrollOffset += visible; // page up
+                else if (vk == 0x22) viewerScrollOffset -= visible; // page down
+                else if (vk == 0x24) viewerScrollOffset = viewerMaxScroll; // home
+                else if (vk == 0x23) viewerScrollOffset = 0;      // end
+                else return DefWindowProc(hWnd, msg, wParam, lParam);
+                if (viewerScrollOffset < 0) viewerScrollOffset = 0;
+                if (viewerScrollOffset > viewerMaxScroll) viewerScrollOffset = viewerMaxScroll;
+                InvalidateRect(logViewerHwnd, IntPtr.Zero, false);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == logViewerHwnd && msg == WM_MOUSEWHEEL)
+            {
+                int delta = (short)((long)wParam >> 16);
+                viewerScrollOffset += (delta / 120) * 3;
+                if (viewerScrollOffset < 0) viewerScrollOffset = 0;
+                if (viewerScrollOffset > viewerMaxScroll) viewerScrollOffset = viewerMaxScroll;
+                InvalidateRect(logViewerHwnd, IntPtr.Zero, false);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == logViewerHwnd && msg == WM_LBUTTONDOWN)
+            {
+                int x = (short)((long)lParam & 0xffff);
+                int y = (short)(((long)lParam >> 16) & 0xffff);
+
+                RECT client;
+                GetClientRect(logViewerHwnd, out client);
+                RECT logRect = GetViewerLogRect(client);
+                int trackTop, trackBottom, trackX, trackW, thumbTop, thumbH;
+                GetViewerScrollbarGeometry(logRect, out trackTop, out trackBottom,
+                    out trackX, out trackW, out thumbTop, out thumbH);
+
+                bool inThumb = x >= trackX && x < trackX + trackW
+                    && y >= thumbTop && y < thumbTop + thumbH;
+                if (inThumb)
+                {
+                    viewerDragging = true;
+                    viewerDragStartY = y;
+                    viewerDragStartOffset = viewerScrollOffset;
+                    SetCapture(logViewerHwnd);
+                    return IntPtr.Zero;
+                }
+                bool inTrack = x >= trackX && x < trackX + trackW
+                    && y >= trackTop && y < trackBottom;
+                if (inTrack)
+                {
+                    int visible = GetViewerVisibleRows(logRect);
+                    if (y < thumbTop) viewerScrollOffset += visible;
+                    else viewerScrollOffset -= visible;
+                    if (viewerScrollOffset < 0) viewerScrollOffset = 0;
+                    if (viewerScrollOffset > viewerMaxScroll) viewerScrollOffset = viewerMaxScroll;
+                    InvalidateRect(logViewerHwnd, IntPtr.Zero, false);
+                    return IntPtr.Zero;
+                }
+
+                viewerButtonPressed = GetViewerButtonAt(x, y);
+                if (viewerButtonPressed != 0) SetCapture(logViewerHwnd);
+                InvalidateRect(logViewerHwnd, IntPtr.Zero, false);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == logViewerHwnd && msg == WM_MOUSEMOVE)
+            {
+                int x = (short)((long)lParam & 0xffff);
+                int y = (short)(((long)lParam >> 16) & 0xffff);
+                if (viewerDragging)
+                {
+                    ViewerSetScrollFromDrag(y);
+                    return IntPtr.Zero;
+                }
+                int button = GetViewerButtonAt(x, y);
+                if (button != viewerButtonHover)
+                {
+                    viewerButtonHover = button;
+                    InvalidateRect(logViewerHwnd, IntPtr.Zero, false);
+                }
+                if (button != 0) SetCursor(LoadCursor(IntPtr.Zero, (IntPtr)IDC_HAND));
+                TRACKMOUSEEVENT tracking = new TRACKMOUSEEVENT();
+                tracking.cbSize = (uint)Marshal.SizeOf<TRACKMOUSEEVENT>();
+                tracking.dwFlags = TME_LEAVE;
+                tracking.hwndTrack = logViewerHwnd;
+                TrackMouseEvent(ref tracking);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == logViewerHwnd && msg == WM_LBUTTONUP)
+            {
+                int x = (short)((long)lParam & 0xffff);
+                int y = (short)(((long)lParam >> 16) & 0xffff);
+                if (viewerDragging)
+                {
+                    viewerDragging = false;
+                    ReleaseCapture();
+                    return IntPtr.Zero;
+                }
+                int button = GetViewerButtonAt(x, y);
+                int clicked = viewerButtonPressed == button ? button : 0;
+                viewerButtonPressed = 0;
+                ReleaseCapture();
+                InvalidateRect(logViewerHwnd, IntPtr.Zero, false);
+                if (clicked == 1) LoadViewerTail();
+                else if (clicked == 2) ShowWindow(logViewerHwnd, SW_HIDE);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == logViewerHwnd && msg == WM_MOUSELEAVE)
+            {
+                viewerButtonHover = 0;
+                if (viewerButtonPressed == 0) InvalidateRect(logViewerHwnd, IntPtr.Zero, false);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == logViewerHwnd && msg == WM_PAINT)
+            {
+                PaintLogViewer();
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == logViewerHwnd && msg == WM_ERASEBKGND) return (IntPtr)1;
+
+            if (hWnd == logViewerHwnd && msg == WM_SETTINGCHANGE)
+            {
+                RefreshSystemTheme();
+                InvalidateRect(logViewerHwnd, IntPtr.Zero, false);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == logHwnd && msg == WM_LBUTTONUP)
+            {
+                int x = (short)((long)lParam & 0xffff);
+                int y = (short)(((long)lParam >> 16) & 0xffff);
+                int button = GetLogButtonAt(x, y);
+                int clicked = pressedLogButton == button ? button : 0;
+                pressedLogButton = 0;
+                ReleaseCapture();
+                InvalidateRect(logHwnd, IntPtr.Zero, false);
+                if (clicked == 1) ShowLogViewer();
+                else if (clicked == 2)
+                {
+                    logDismissedByUser = true;
+                    ShowWindow(logHwnd, SW_HIDE);
+                }
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == logHwnd && msg == WM_LBUTTONDOWN)
+            {
+                int x = (short)((long)lParam & 0xffff);
+                int y = (short)(((long)lParam >> 16) & 0xffff);
+                pressedLogButton = GetLogButtonAt(x, y);
+                if (pressedLogButton != 0) SetCapture(logHwnd);
+                InvalidateRect(logHwnd, IntPtr.Zero, false);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == logHwnd && msg == WM_MOUSEMOVE)
+            {
+                int x = (short)((long)lParam & 0xffff);
+                int y = (short)(((long)lParam >> 16) & 0xffff);
+                int button = GetLogButtonAt(x, y);
+                if (button != hoveredLogButton)
+                {
+                    hoveredLogButton = button;
+                    InvalidateRect(logHwnd, IntPtr.Zero, false);
+                }
+                if (button != 0) SetCursor(LoadCursor(IntPtr.Zero, (IntPtr)IDC_HAND));
+                TRACKMOUSEEVENT tracking = new TRACKMOUSEEVENT();
+                tracking.cbSize = (uint)Marshal.SizeOf<TRACKMOUSEEVENT>();
+                tracking.dwFlags = TME_LEAVE;
+                tracking.hwndTrack = logHwnd;
+                TrackMouseEvent(ref tracking);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == logHwnd && msg == WM_MOUSELEAVE)
+            {
+                hoveredLogButton = 0;
+                if (pressedLogButton == 0) InvalidateRect(logHwnd, IntPtr.Zero, false);
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == logHwnd && msg == WM_PAINT)
+            {
+                PaintLogWindow();
+                return IntPtr.Zero;
+            }
+
+            if (hWnd == logHwnd && msg == WM_ERASEBKGND) return (IntPtr)1;
+
+            if (hWnd == logHwnd && msg == WM_SETTINGCHANGE)
+            {
+                RefreshSystemTheme();
+                InvalidateRect(logHwnd, IntPtr.Zero, false);
                 return IntPtr.Zero;
             }
 
@@ -678,10 +930,9 @@ namespace DshTray
                 pressedProgressButton = 0;
                 ReleaseCapture();
                 InvalidateRect(progressHwnd, IntPtr.Zero, false);
-                if (clicked == 1) core.OpenLog();
+                if (clicked == 1) ShowLogViewer();
                 else if (clicked == 2)
                 {
-                    progressDismissedByUser = true;
                     ShowWindow(progressHwnd, SW_HIDE);
                 }
                 return IntPtr.Zero;
@@ -867,7 +1118,7 @@ namespace DshTray
             menuItems.Add(profile);
 
             if (hasUpdateProgress)
-                menuItems.Add(new MenuItemData { Text = "显示更新进度", CommandId = ID_PROGRESS });
+                menuItems.Add(new MenuItemData { Text = "显示日志", CommandId = ID_PROGRESS });
 
             menuItems.Add(new MenuItemData { IsSeparator = true });
             menuItems.Add(new MenuItemData { Text = "打开网页", CommandId = ID_OPEN });
@@ -1167,15 +1418,15 @@ namespace DshTray
 
         private static void QueueNotification(string title, string text)
         {
-            AppendProgressLog(text);
+            AppendLogLine(text);
             lock (progressLock)
             {
+                logPendingNotify = true;
                 hasUpdateProgress = true;
-                pendingProgressNotify = true;
             }
             // Core can call Notify from npx output / port-watcher threads, so marshal
             // the window update back to the tray window's UI thread.
-            if (hwnd != IntPtr.Zero) PostMessage(hwnd, WM_APP_PROGRESS, IntPtr.Zero, IntPtr.Zero);
+            if (hwnd != IntPtr.Zero) PostMessage(hwnd, WM_APP_LOG, IntPtr.Zero, IntPtr.Zero);
         }
 
         private static void QueueStatus(string text)
@@ -1234,7 +1485,7 @@ namespace DshTray
                 int y = Math.Max(0, (GetSystemMetrics(SM_CYSCREEN) - height) / 3);
                 IntPtr hInstance = GetModuleHandle(null);
                 updatePromptHwnd = CreateWindowEx(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, ClassName,
-                    "DeepSeek Harness 更新", WS_CAPTION | WS_SYSMENU,
+                    "DSH Tray 更新", WS_CAPTION | WS_SYSMENU,
                     x, y, width, height, IntPtr.Zero, IntPtr.Zero, hInstance, IntPtr.Zero);
                 if (updatePromptHwnd == IntPtr.Zero) return 1;
                 SendMessage(updatePromptHwnd, 0x0080, (IntPtr)1, hIcon); // WM_SETICON / ICON_BIG
@@ -1448,7 +1699,7 @@ namespace DshTray
                 return;
             }
             core.SetDshProfile(name);
-            QueueNotification("DeepSeek Harness", "Profile " + name + " 已创建并切换。");
+            QueueNotification("DSH Tray", "Profile " + name + " 已创建并切换。");
         }
 
         /// <summary>Number of profile rows shown in the delete dialog before truncation.</summary>
@@ -1472,7 +1723,7 @@ namespace DshTray
                     0x00000010 /* MB_ICONERROR */ | 0x00000000 /* MB_OK */);
                 return;
             }
-            QueueNotification("DeepSeek Harness", "Profile " + name + " 已删除。");
+            QueueNotification("DSH Tray", "Profile " + name + " 已删除。");
         }
 
         /// <summary>
@@ -1785,30 +2036,30 @@ namespace DshTray
         {
             lock (progressLock)
             {
-                pendingProgressStage = stage;
-                if (!string.IsNullOrWhiteSpace(detail)) pendingProgressDetail = detail;
+                if (!string.IsNullOrWhiteSpace(stage)) currentLogStage = stage;
                 hasUpdateProgress = true;
             }
-            if (hwnd != IntPtr.Zero) PostMessage(hwnd, WM_APP_PROGRESS, IntPtr.Zero, IntPtr.Zero);
+            if (!string.IsNullOrWhiteSpace(detail)) AppendLogLine(detail);
+            if (hwnd != IntPtr.Zero) PostMessage(hwnd, WM_APP_LOG, IntPtr.Zero, IntPtr.Zero);
         }
 
         private static void QueueProgressStarted()
         {
             lock (progressLock)
             {
-                pendingProgressStarted = true;
+                logPendingStarted = true;
                 hasUpdateProgress = true;
             }
-            if (hwnd != IntPtr.Zero) PostMessage(hwnd, WM_APP_PROGRESS, IntPtr.Zero, IntPtr.Zero);
+            if (hwnd != IntPtr.Zero) PostMessage(hwnd, WM_APP_LOG, IntPtr.Zero, IntPtr.Zero);
         }
 
         private static void QueueProgressCompleted()
         {
             lock (progressLock)
             {
-                pendingProgressCompleted = true;
+                logPendingCompleted = true;
             }
-            if (hwnd != IntPtr.Zero) PostMessage(hwnd, WM_APP_PROGRESS, IntPtr.Zero, IntPtr.Zero);
+            if (hwnd != IntPtr.Zero) PostMessage(hwnd, WM_APP_LOG, IntPtr.Zero, IntPtr.Zero);
         }
 
         private static void QueueUpdateAvailable(string tag, string downloadUrl, string releaseUrl)
@@ -1873,7 +2124,6 @@ namespace DshTray
             if (progressHwnd == IntPtr.Zero) return;
             currentProgressStage = "正在下载更新…";
             currentProgressPercent = percent;
-            progressDismissedByUser = false;
             progressIsCompleted = false;
             AppendProgressLog("下载进度：" + detail);
             InvalidateRect(progressHwnd, IntPtr.Zero, false);
@@ -1941,7 +2191,7 @@ namespace DshTray
                 AppendProgressLog("更新失败：" + (string.IsNullOrEmpty(reason) ? "未知错误" : reason));
                 InvalidateRect(progressHwnd, IntPtr.Zero, false);
             }
-            QueueNotification("DeepSeek Harness", "自动更新失败：" + (string.IsNullOrEmpty(reason) ? "未知错误" : reason));
+            QueueNotification("DSH Tray", "自动更新失败：" + (string.IsNullOrEmpty(reason) ? "未知错误" : reason));
 
             // The service was held back for the update; start it now instead
             // of leaving the tray without a service.
@@ -1958,7 +2208,7 @@ namespace DshTray
             {
                 string installDir = Path.Combine(
                     Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "Programs", "DeepSeek Harness Tray");
+                    "Programs", "DSH Tray");
                 string targetExe = Path.Combine(installDir, "dsh-tray.exe");
                 string batPath = Path.Combine(Path.GetDirectoryName(installerPath), "apply-update.cmd");
 
@@ -1986,69 +2236,88 @@ namespace DshTray
             }
         }
 
-        private static void DrainProgress()
+        /// <summary>Marshalled (UI thread) log-window update: refresh stage,
+        /// show the window, and (re)arm the auto-hide timer.</summary>
+        private static void DrainLog()
         {
-            string stage;
-            string detail;
-            bool completed;
-            bool started;
-            bool notify;
+            bool notify, started, completed;
             lock (progressLock)
             {
-                stage = pendingProgressStage;
-                pendingProgressStage = null;
-                detail = pendingProgressDetail;
-                pendingProgressDetail = null;
-                completed = pendingProgressCompleted;
-                started = pendingProgressStarted;
-                pendingProgressCompleted = false;
-                pendingProgressStarted = false;
-                notify = pendingProgressNotify;
-                pendingProgressNotify = false;
+                notify = logPendingNotify;
+                logPendingNotify = false;
+                started = logPendingStarted;
+                logPendingStarted = false;
+                completed = logPendingCompleted;
+                logPendingCompleted = false;
             }
 
-            if (!string.IsNullOrWhiteSpace(detail)) AppendProgressLog(detail);
-
-            EnsureProgressWindow();
-            if (progressHwnd == IntPtr.Zero) return;
             if (started)
             {
-                progressDismissedByUser = false;
-                progressIsCompleted = false;
-                currentProgressPercent = -1;
+                logDismissedByUser = false;
+                logIsCompleted = false;
             }
-            if (stage != null) currentProgressStage = stage;
+            if (completed) logIsCompleted = true;
 
-            if (completed)
-            {
-                progressIsCompleted = true;
-                KillTimer(progressHwnd, (UIntPtr)2);
-                // Service is ready: show for 1 second, then fall back to the tray.
-                SetTimer(progressHwnd, (UIntPtr)1, 1000, IntPtr.Zero);
-            }
-            else if (!progressIsCompleted && stage != null)
-            {
-                SetTimer(progressHwnd, (UIntPtr)2, 35, IntPtr.Zero);
-            }
-            else if (notify && !progressIsCompleted && stage == null && !started)
-            {
-                // A standalone notification (no in-flight progress stage): show
-                // the window briefly, then hide it again automatically.
-                KillTimer(progressHwnd, (UIntPtr)2);
-                SetTimer(progressHwnd, (UIntPtr)1, 6000, IntPtr.Zero);
-            }
+            EnsureLogWindow();
+            if (logHwnd == IntPtr.Zero) return;
+            InvalidateRect(logHwnd, IntPtr.Zero, false);
 
-            InvalidateRect(progressHwnd, IntPtr.Zero, false);
-            if (!progressDismissedByUser)
+            // Every event re-arms the hide timer: completed -> 2s, any other
+            // activity (notification, stage line) -> 6s.
+            KillTimer(logHwnd, (UIntPtr)1);
+            int hideMs = logIsCompleted ? LogWindowHideCompletedMs : LogWindowHideNotifyMs;
+            SetTimer(logHwnd, (UIntPtr)1, (uint)hideMs, IntPtr.Zero);
+
+            if (!logDismissedByUser) ShowLogWindow();
+        }
+
+        private static void EnsureLogWindow()
+        {
+            if (logHwnd != IntPtr.Zero) return;
+
+            const int width = 540;
+            const int height = 300;
+            int x = Math.Max(0, GetSystemMetrics(SM_CXSCREEN) - width - 24);
+            int y = Math.Max(0, GetSystemMetrics(SM_CYSCREEN) - height - 64);
+            IntPtr hInstance = GetModuleHandle(null);
+            logHwnd = CreateWindowEx(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, ClassName,
+                "DSH Tray 日志", WS_CAPTION | WS_SYSMENU,
+                x, y, width, height, IntPtr.Zero, IntPtr.Zero, hInstance, IntPtr.Zero);
+            if (logHwnd == IntPtr.Zero) return;
+            SendMessage(logHwnd, 0x0080, (IntPtr)1, hIcon); // WM_SETICON / ICON_BIG
+            RefreshSystemTheme();
+            if (headingFont == IntPtr.Zero) headingFont = CreateUiFont(-22, 600, "Microsoft YaHei UI");
+            if (bodyFont == IntPtr.Zero) bodyFont = CreateUiFont(-14, 400, "Microsoft YaHei UI");
+            if (logFont == IntPtr.Zero) logFont = CreateUiFont(-13, 400, "Cascadia Mono");
+        }
+
+        private static void ShowLogWindow()
+        {
+            if (logHwnd == IntPtr.Zero) EnsureLogWindow();
+            if (logHwnd != IntPtr.Zero) ShowWindow(logHwnd, SW_SHOWNOACTIVATE);
+        }
+
+        private static void AppendLogLine(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return;
+            string line = text.Trim();
+            if (line.Length > 220) line = line.Substring(0, 217) + "...";
+            lock (progressLock)
             {
-                ShowProgressWindow();
-                if (progressIsCompleted)
-                {
-                    // Log lines arriving after startup re-show the window once;
-                    // hide it again after 1 second.
-                    SetTimer(progressHwnd, (UIntPtr)1, 1000, IntPtr.Zero);
-                }
+                if (logLines.Count > 0 && logLines[logLines.Count - 1] == line) return;
+                logLines.Add(line);
+                if (logLines.Count > MaxLogLines)
+                    logLines.RemoveRange(0, logLines.Count - MaxLogLines);
             }
+        }
+
+        private static int GetLogButtonAt(int x, int y)
+        {
+            RECT client;
+            GetClientRect(logHwnd, out client);
+            if (PointInRect(GetLogButtonRect(client), x, y)) return 1;
+            if (PointInRect(GetHideButtonRect(client), x, y)) return 2;
+            return 0;
         }
 
         private static void EnsureProgressWindow()
@@ -2066,9 +2335,9 @@ namespace DshTray
             if (progressHwnd == IntPtr.Zero) return;
             SendMessage(progressHwnd, 0x0080, (IntPtr)1, hIcon); // WM_SETICON / ICON_BIG
             RefreshSystemTheme();
-            headingFont = CreateUiFont(-22, 600, "Microsoft YaHei UI");
-            bodyFont = CreateUiFont(-14, 400, "Microsoft YaHei UI");
-            logFont = CreateUiFont(-13, 400, "Cascadia Mono");
+            if (headingFont == IntPtr.Zero) headingFont = CreateUiFont(-22, 600, "Microsoft YaHei UI");
+            if (bodyFont == IntPtr.Zero) bodyFont = CreateUiFont(-14, 400, "Microsoft YaHei UI");
+            if (logFont == IntPtr.Zero) logFont = CreateUiFont(-13, 400, "Cascadia Mono");
             SetTimer(progressHwnd, (UIntPtr)2, 35, IntPtr.Zero);
         }
 
@@ -2105,7 +2374,7 @@ namespace DshTray
             }
         }
 
-        private static void DrawLogLines(IntPtr dc, RECT rect, IntPtr font, int color)
+        private static void DrawLogLines(IntPtr dc, RECT rect, IntPtr font, int color, List<string> source)
         {
             const int lineHeight = 18;
             int maxLines = Math.Max(1, (rect.Bottom - rect.Top) / lineHeight);
@@ -2113,10 +2382,10 @@ namespace DshTray
             string[] lines;
             lock (progressLock)
             {
-                int start = Math.Max(0, progressLogLines.Count - maxLines);
-                int count = progressLogLines.Count - start;
+                int start = Math.Max(0, source.Count - maxLines);
+                int count = source.Count - start;
                 lines = new string[count];
-                for (int i = 0; i < count; i++) lines[i] = progressLogLines[start + i];
+                for (int i = 0; i < count; i++) lines[i] = source[start + i];
             }
 
             IntPtr oldFont = SelectObject(dc, font);
@@ -2187,7 +2456,7 @@ namespace DshTray
             DrawLabel(buffer, "启动日志", logTitle, bodyFont, secondary,
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             RECT logRect = new RECT(24, 116, client.Right - 24, client.Bottom - 70);
-            DrawLogLines(buffer, logRect, logFont, logText);
+            DrawLogLines(buffer, logRect, logFont, logText, progressLogLines);
 
             RECT logButton = GetLogButtonRect(client);
             int logButtonColor = useDarkTheme
@@ -2214,6 +2483,254 @@ namespace DshTray
             DeleteObject(bitmap);
             DeleteDC(buffer);
             EndPaint(progressHwnd, ref paint);
+        }
+
+        private static void PaintLogWindow()
+        {
+            PAINTSTRUCT paint;
+            IntPtr target = BeginPaint(logHwnd, out paint);
+            if (target == IntPtr.Zero) return;
+
+            RECT client;
+            GetClientRect(logHwnd, out client);
+            IntPtr buffer = CreateCompatibleDC(target);
+            IntPtr bitmap = CreateCompatibleBitmap(target, client.Right, client.Bottom);
+            IntPtr oldBitmap = SelectObject(buffer, bitmap);
+
+            int background = useDarkTheme ? Rgb(31, 33, 36) : Rgb(250, 251, 252);
+            int heading = useDarkTheme ? Rgb(242, 244, 246) : Rgb(24, 29, 35);
+            int secondary = useDarkTheme ? Rgb(169, 176, 184) : Rgb(91, 99, 108);
+            int logText = useDarkTheme ? Rgb(215, 219, 224) : Rgb(51, 58, 66);
+            int accent = useDarkTheme ? Rgb(45, 169, 151) : Rgb(23, 126, 113);
+            FillColor(buffer, client, background);
+
+            RECT titleRect = new RECT(24, 18, client.Right - 24, 46);
+            DrawLabel(buffer, "启动日志", titleRect, headingFont, heading,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+            RECT stageRect = new RECT(24, 50, client.Right - 24, 72);
+            DrawLabel(buffer, currentLogStage, stageRect, bodyFont, secondary,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+            RECT logRect = new RECT(24, 78, client.Right - 24, client.Bottom - 70);
+            DrawLogLines(buffer, logRect, logFont, logText, logLines);
+
+            RECT logButton = GetLogButtonRect(client);
+            int logButtonColor = useDarkTheme
+                ? (pressedLogButton == 1 ? Rgb(83, 89, 96)
+                    : hoveredLogButton == 1 ? Rgb(70, 76, 82) : Rgb(55, 60, 66))
+                : (pressedLogButton == 1 ? Rgb(205, 211, 216)
+                    : hoveredLogButton == 1 ? Rgb(218, 223, 227) : Rgb(232, 235, 238));
+            FillRounded(buffer, logButton, 6, logButtonColor);
+            DrawLabel(buffer, "查看日志", logButton, bodyFont,
+                useDarkTheme ? Rgb(242, 244, 246) : Rgb(38, 44, 51),
+                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | 0x0001);
+
+            RECT hideButton = GetHideButtonRect(client);
+            int hideButtonColor = useDarkTheme
+                ? (pressedLogButton == 2 ? Rgb(25, 126, 112)
+                    : hoveredLogButton == 2 ? Rgb(54, 186, 166) : accent)
+                : (pressedLogButton == 2 ? Rgb(12, 91, 82)
+                    : hoveredLogButton == 2 ? Rgb(15, 110, 99) : accent);
+            FillRounded(buffer, hideButton, 6, hideButtonColor);
+            DrawLabel(buffer, "后台运行", hideButton, bodyFont, Rgb(255, 255, 255),
+                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | 0x0001);
+
+            BitBlt(target, 0, 0, client.Right, client.Bottom, buffer, 0, 0, SRCCOPY);
+            SelectObject(buffer, oldBitmap);
+            DeleteObject(bitmap);
+            DeleteDC(buffer);
+            EndPaint(logHwnd, ref paint);
+        }
+
+        // ---- Self-drawn log viewer (streaming tail; replaces notepad) ----
+
+        private static void ShowLogViewer()
+        {
+            EnsureLogViewer();
+            if (logViewerHwnd == IntPtr.Zero) return;
+            LoadViewerTail();
+            ShowWindow(logViewerHwnd, SW_SHOW);
+            SetForegroundWindow(logViewerHwnd);
+        }
+
+        private static void EnsureLogViewer()
+        {
+            if (logViewerHwnd != IntPtr.Zero) return;
+
+            const int width = 900;
+            const int height = 560;
+            int x = Math.Max(0, (GetSystemMetrics(SM_CXSCREEN) - width) / 2);
+            int y = Math.Max(0, (GetSystemMetrics(SM_CYSCREEN) - height) / 3);
+            IntPtr hInstance = GetModuleHandle(null);
+            logViewerHwnd = CreateWindowEx(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, ClassName,
+                "DSH Tray 日志", WS_CAPTION | WS_SYSMENU,
+                x, y, width, height, IntPtr.Zero, IntPtr.Zero, hInstance, IntPtr.Zero);
+            if (logViewerHwnd == IntPtr.Zero) return;
+            SendMessage(logViewerHwnd, 0x0080, (IntPtr)1, hIcon); // WM_SETICON / ICON_BIG
+            RefreshSystemTheme();
+            if (headingFont == IntPtr.Zero) headingFont = CreateUiFont(-22, 600, "Microsoft YaHei UI");
+            if (bodyFont == IntPtr.Zero) bodyFont = CreateUiFont(-14, 400, "Microsoft YaHei UI");
+            if (logFont == IntPtr.Zero) logFont = CreateUiFont(-13, 400, "Cascadia Mono");
+        }
+
+        private static void LoadViewerTail()
+        {
+            viewerLines.Clear();
+            viewerLines.AddRange(Core.ReadLogTail(core.ServerLogPath, ViewerMaxLines));
+            RecomputeViewerScroll();
+            InvalidateRect(logViewerHwnd, IntPtr.Zero, false);
+        }
+
+        private static RECT GetViewerLogRect(RECT client)
+        {
+            // Scroll bar occupies the right 22px inside the log area.
+            return new RECT(24, 84, client.Right - 62, client.Bottom - 70);
+        }
+
+        private static int GetViewerVisibleRows(RECT logRect)
+        {
+            return Math.Max(1, (logRect.Bottom - logRect.Top) / ViewerLineHeight);
+        }
+
+        private static void RecomputeViewerScroll()
+        {
+            RECT client;
+            GetClientRect(logViewerHwnd, out client);
+            RECT logRect = GetViewerLogRect(client);
+            int visible = GetViewerVisibleRows(logRect);
+            viewerMaxScroll = Math.Max(0, viewerLines.Count - visible);
+            if (viewerScrollOffset < 0) viewerScrollOffset = 0;
+            if (viewerScrollOffset > viewerMaxScroll) viewerScrollOffset = viewerMaxScroll;
+        }
+
+        private static void GetViewerScrollbarGeometry(RECT logRect, out int trackTop, out int trackBottom,
+            out int trackX, out int trackW, out int thumbTop, out int thumbH)
+        {
+            trackX = logRect.Right - 14;
+            trackW = 8;
+            trackTop = logRect.Top + 4;
+            trackBottom = logRect.Bottom - 4;
+            int trackH = trackBottom - trackTop;
+            int visible = GetViewerVisibleRows(logRect);
+            int total = viewerLines.Count;
+            thumbH = Math.Max(28, trackH * visible / Math.Max(1, total));
+            if (thumbH > trackH) thumbH = trackH;
+            int range = trackH - thumbH;
+            int offset = viewerMaxScroll > 0 ? viewerScrollOffset : 0;
+            thumbTop = trackTop + (range > 0 ? (int)((long)offset * range / viewerMaxScroll) : 0);
+        }
+
+        private static void PaintLogViewer()
+        {
+            PAINTSTRUCT paint;
+            IntPtr target = BeginPaint(logViewerHwnd, out paint);
+            if (target == IntPtr.Zero) return;
+
+            RECT client;
+            GetClientRect(logViewerHwnd, out client);
+            IntPtr buffer = CreateCompatibleDC(target);
+            IntPtr bitmap = CreateCompatibleBitmap(target, client.Right, client.Bottom);
+            IntPtr oldBitmap = SelectObject(buffer, bitmap);
+
+            int background = useDarkTheme ? Rgb(31, 33, 36) : Rgb(250, 251, 252);
+            int heading = useDarkTheme ? Rgb(242, 244, 246) : Rgb(24, 29, 35);
+            int secondary = useDarkTheme ? Rgb(169, 176, 184) : Rgb(91, 99, 108);
+            int logText = useDarkTheme ? Rgb(215, 219, 224) : Rgb(51, 58, 66);
+            int trackColor = useDarkTheme ? Rgb(55, 60, 66) : Rgb(222, 226, 230);
+            int accent = useDarkTheme ? Rgb(45, 169, 151) : Rgb(23, 126, 113);
+            FillColor(buffer, client, background);
+
+            RECT titleRect = new RECT(24, 18, client.Right - 24, 52);
+            DrawLabel(buffer, "日志", titleRect, headingFont, heading,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+            RECT infoRect = new RECT(client.Right - 320, 26, client.Right - 24, 48);
+            DrawLabel(buffer, viewerLines.Count + " 行（最新 " + ViewerMaxLines + " 行）",
+                infoRect, bodyFont, secondary,
+                DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+            RECT logRect = GetViewerLogRect(client);
+            RECT logArea = new RECT(logRect.Left, logRect.Top, logRect.Right - 14, logRect.Bottom);
+            int visible = GetViewerVisibleRows(logRect);
+            int total = viewerLines.Count;
+
+            // Paint the visible rows (newest at the bottom when offset == 0).
+            int first = Math.Max(0, total - visible - viewerScrollOffset);
+            for (int i = first; i < total; i++)
+            {
+                RECT lineRect = new RECT(logArea.Left, logArea.Top + (i - first) * ViewerLineHeight,
+                    logArea.Right, logArea.Top + (i - first + 1) * ViewerLineHeight);
+                DrawLabel(buffer, viewerLines[i] ?? string.Empty, lineRect, logFont, logText,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+            }
+
+            // Scroll bar.
+            int trackTop, trackBottom, trackX, trackW, thumbTop, thumbH;
+            GetViewerScrollbarGeometry(logRect, out trackTop, out trackBottom,
+                out trackX, out trackW, out thumbTop, out thumbH);
+            RECT track = new RECT(trackX, trackTop, trackX + trackW, trackBottom);
+            FillRounded(buffer, track, 4, trackColor);
+            RECT thumb = new RECT(trackX, thumbTop, trackX + trackW, thumbTop + thumbH);
+            FillRounded(buffer, thumb, 4, accent);
+
+            RECT refreshRect = GetLogButtonRect(client);
+            int refreshColor = useDarkTheme
+                ? (viewerButtonPressed == 1 ? Rgb(83, 89, 96)
+                    : viewerButtonHover == 1 ? Rgb(70, 76, 82) : Rgb(55, 60, 66))
+                : (viewerButtonPressed == 1 ? Rgb(205, 211, 216)
+                    : viewerButtonHover == 1 ? Rgb(218, 223, 227) : Rgb(232, 235, 238));
+            FillRounded(buffer, refreshRect, 6, refreshColor);
+            DrawLabel(buffer, "刷新", refreshRect, bodyFont,
+                useDarkTheme ? Rgb(242, 244, 246) : Rgb(38, 44, 51),
+                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | 0x0001);
+
+            RECT closeRect = GetHideButtonRect(client);
+            int closeColor = useDarkTheme
+                ? (viewerButtonPressed == 2 ? Rgb(25, 126, 112)
+                    : viewerButtonHover == 2 ? Rgb(54, 186, 166) : accent)
+                : (viewerButtonPressed == 2 ? Rgb(12, 91, 82)
+                    : viewerButtonHover == 2 ? Rgb(15, 110, 99) : accent);
+            FillRounded(buffer, closeRect, 6, closeColor);
+            DrawLabel(buffer, "关闭", closeRect, bodyFont, Rgb(255, 255, 255),
+                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | 0x0001);
+
+            BitBlt(target, 0, 0, client.Right, client.Bottom, buffer, 0, 0, SRCCOPY);
+            SelectObject(buffer, oldBitmap);
+            DeleteObject(bitmap);
+            DeleteDC(buffer);
+            EndPaint(logViewerHwnd, ref paint);
+        }
+
+        private static int GetViewerButtonAt(int x, int y)
+        {
+            RECT client;
+            GetClientRect(logViewerHwnd, out client);
+            if (PointInRect(GetLogButtonRect(client), x, y)) return 1;
+            if (PointInRect(GetHideButtonRect(client), x, y)) return 2;
+            return 0;
+        }
+
+        /// <summary>Set the scroll offset from a pixel position in the scrollbar thumb area.</summary>
+        private static void ViewerSetScrollFromDrag(int mouseY)
+        {
+            RECT client;
+            GetClientRect(logViewerHwnd, out client);
+            RECT logRect = GetViewerLogRect(client);
+            int trackTop, trackBottom, trackX, trackW, thumbTop, thumbH;
+            GetViewerScrollbarGeometry(logRect, out trackTop, out trackBottom,
+                out trackX, out trackW, out thumbTop, out thumbH);
+            int range = (trackBottom - trackTop) - thumbH;
+            if (range <= 0) return;
+            int delta = mouseY - viewerDragStartY;
+            int offset = viewerDragStartOffset + (int)((long)delta * viewerMaxScroll / range);
+            if (offset < 0) offset = 0;
+            if (offset > viewerMaxScroll) offset = viewerMaxScroll;
+            if (offset != viewerScrollOffset)
+            {
+                viewerScrollOffset = offset;
+                InvalidateRect(logViewerHwnd, IntPtr.Zero, false);
+            }
         }
 
         private static RECT GetLogButtonRect(RECT client)
@@ -2329,6 +2846,16 @@ namespace DshTray
             {
                 DestroyWindow(progressHwnd);
                 progressHwnd = IntPtr.Zero;
+            }
+            if (logHwnd != IntPtr.Zero)
+            {
+                DestroyWindow(logHwnd);
+                logHwnd = IntPtr.Zero;
+            }
+            if (logViewerHwnd != IntPtr.Zero)
+            {
+                DestroyWindow(logViewerHwnd);
+                logViewerHwnd = IntPtr.Zero;
             }
             if (updatePromptHwnd != IntPtr.Zero)
             {

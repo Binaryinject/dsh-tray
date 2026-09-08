@@ -432,6 +432,9 @@ namespace DshTray
         public bool ShuttingDown { get { return shuttingDown; } }
         public string Url { get { return "http://127.0.0.1:" + port; } }
 
+        /// <summary>Absolute path of the server log (used by the log viewer).</summary>
+        public string ServerLogPath { get { return logPath; } }
+
         /// <summary>The currently selected dsh dist-tag branch (latest / next / alpha).</summary>
         public string DshBranch { get { return dshBranch; } }
 
@@ -969,10 +972,7 @@ namespace DshTray
                     File.WriteAllLines(latestLogPath, lines);
                 }
 #if WINDOWS
-                ProcessStartInfo viewer = new ProcessStartInfo("notepad.exe");
-                viewer.UseShellExecute = false;
-                viewer.ArgumentList.Add(latestLogPath);
-                Process.Start(viewer);
+                // 不再使用 notepad（由 Windows 平台层的自绘日志查看器接管）。
 #else
                 Process.Start(new ProcessStartInfo("open", latestLogPath) { UseShellExecute = false });
 #endif
@@ -980,6 +980,70 @@ namespace DshTray
             catch
             {
             }
+        }
+
+        /// <summary>
+        /// Streaming tail read of the server log: the last <paramref name="maxLines"/>
+        /// lines, scanned from EOF backwards in blocks, so arbitrarily large logs
+        /// stay fast and memory-bounded. Returns lines in file order.
+        /// </summary>
+        public static List<string> ReadLogTail(string path, int maxLines)
+        {
+            List<string> result = new List<string>();
+            try
+            {
+                if (string.IsNullOrEmpty(path) || !File.Exists(path)) return result;
+
+                using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    long length = stream.Length;
+                    if (length == 0) return result;
+
+                    const int blockSize = 64 * 1024;
+                    byte[] buffer = new byte[blockSize];
+                    StringBuilder sb = new StringBuilder();
+                    long pos = length;
+                    int newlineCount = 0;
+
+                    while (pos > 0)
+                    {
+                        int toRead = (int)Math.Min(blockSize, pos);
+                        pos -= toRead;
+                        stream.Seek(pos, SeekOrigin.Begin);
+                        int read = stream.Read(buffer, 0, toRead);
+                        if (read <= 0) break;
+
+                        string chunk = Encoding.UTF8.GetString(buffer, 0, read);
+                        sb.Insert(0, chunk);
+                        for (int i = 0; i < chunk.Length; i++)
+                            if (chunk[i] == '\n') newlineCount++;
+
+                        // Enough lines (a margin avoids splitting mid-line).
+                        if (newlineCount >= maxLines + 8) break;
+                    }
+
+                    string text = sb.ToString();
+                    string[] all = text.Split('\n');
+                    int count = all.Length;
+                    // A trailing '\n' yields one empty tail element; that is the
+                    // "nothing after" case and should be dropped. A file without
+                    // trailing newline keeps its (possibly incomplete) last line.
+                    bool endsWithNewline = text.Length > 0 && text[text.Length - 1] == '\n';
+                    if (endsWithNewline) count--;
+
+                    int start = Math.Max(0, count - maxLines);
+                    for (int i = start; i < count; i++)
+                    {
+                        string line = all[i];
+                        if (line.EndsWith("\r")) line = line.Substring(0, line.Length - 1);
+                        result.Add(line);
+                    }
+                }
+            }
+            catch
+            {
+            }
+            return result;
         }
 
         /// <summary>
@@ -1413,7 +1477,7 @@ namespace DshTray
             updateProgressStage = null;
             webReady = false;
             webLaunchUrl = null;
-            UpdateStatus("DeepSeek Harness — 服务正在启动…");
+            UpdateStatus("DSH Tray — 服务正在启动…");
             Action started = UpdateProgressStarted;
             if (started != null) started();
             ReportUpdateProgress("服务正在启动…", null);
@@ -1629,7 +1693,7 @@ namespace DshTray
                 lastNpmActivityUtc = DateTime.UtcNow;
             }
 
-            UpdateStatus("DeepSeek Harness — 正在检查 dsh 依赖…");
+            UpdateStatus("DSH Tray — 正在检查 dsh 依赖…");
             Action started = UpdateProgressStarted;
             if (started != null) started();
             ReportUpdateProgress("正在检查并解析依赖…", line);
@@ -1650,7 +1714,7 @@ namespace DshTray
             {
                 installRequired = true;
                 int count = Interlocked.Increment(ref downloadStepCount);
-                UpdateStatus("DeepSeek Harness — 正在下载 dsh：已完成 " + count + " 个软件包");
+                UpdateStatus("DSH Tray — 正在下载 dsh：已完成 " + count + " 个软件包");
                 ReportUpdateProgress("正在下载软件包（已完成 " + count + " 个）…", null);
             }
         }
@@ -1658,7 +1722,7 @@ namespace DshTray
         private void NotifyUser(string text)
         {
             Action<string, string> cb = Notify;
-            if (cb != null) cb("DeepSeek Harness", text);
+            if (cb != null) cb("DSH Tray", text);
         }
 
         private void UpdateStatus(string text)
@@ -1708,7 +1772,7 @@ namespace DshTray
                             if (completed != null) completed();
                         }
                         if (autoOpen) OpenBrowser();
-                        UpdateStatus("DeepSeek Harness");
+                        UpdateStatus("DSH Tray");
                         return;
                     }
 
@@ -1730,7 +1794,7 @@ namespace DshTray
                         if (!installingStatusShown && currentCount > 0 && idleSeconds >= 10)
                         {
                             installingStatusShown = true;
-                            UpdateStatus("DeepSeek Harness — 已下载 " + currentCount + " 个软件包，正在安装并启动…");
+                            UpdateStatus("DSH Tray — 已下载 " + currentCount + " 个软件包，正在安装并启动…");
                             ReportUpdateProgress("正在安装并启动服务…", null);
                         }
                     }
@@ -1865,9 +1929,9 @@ namespace DshTray
         private void OnServerExited(object sender, EventArgs e)
         {
             if (shuttingDown) return;
-            UpdateStatus("DeepSeek Harness");
+            UpdateStatus("DSH Tray");
             Action<string, string> cb = Notify;
-            if (cb != null) cb("DeepSeek Harness", "服务已退出，详情见日志。");
+            if (cb != null) cb("DSH Tray", "服务已退出，详情见日志。");
         }
 
         private void StopServer()

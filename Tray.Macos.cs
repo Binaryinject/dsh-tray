@@ -37,6 +37,18 @@ namespace DshTray
         private static readonly System.Collections.Generic.List<string> progressLogLines = new System.Collections.Generic.List<string>();
         private const int MaxProgressLogLines = 400;
 
+        // ---- Startup/service log panel state ----
+        private static NSPanel logPanel;
+        private static NSTextField logStatusLabel;
+        private static NSScrollView logScroll;
+        private static NSTextView logView;
+        private static readonly System.Collections.Generic.List<string> logLines = new System.Collections.Generic.List<string>();
+        private const int MaxLogLines = 400;
+        private static bool logDismissedByUser;
+        private static bool logIsCompleted;
+        private static int logHideGeneration;
+        private static string currentLogStage = "服务正在启动…";
+
         public static int Run(Core c)
         {
             core = c;
@@ -61,7 +73,7 @@ namespace DshTray
             statusMenuItem = new NSMenuItem { Title = "状态：正在启动…", Enabled = false };
             NSMenuItem versionMenuItem = new NSMenuItem { Title = "版本 " + SelfUpdater.GetCurrentVersion(), Enabled = false };
             dshVersionMenuItem = new NSMenuItem { Title = core.DshVersionDisplay, Enabled = false };
-            progressMenuItem = MakeItem("显示更新进度", "showProgress:", actions);
+            progressMenuItem = MakeItem("显示日志", "showProgress:", actions);
             progressMenuItem.Hidden = true;
             menu.AddItem(statusMenuItem);
             menu.AddItem(versionMenuItem);
@@ -100,30 +112,36 @@ namespace DshTray
             };
             c.Notify = delegate(string title, string text)
             {
-                app.BeginInvokeOnMainThread(delegate { NotifyToWindow(text); });
+                app.BeginInvokeOnMainThread(delegate { LogNotify(text); });
             };
             c.StatusChanged = delegate (string status)
             {
                 app.BeginInvokeOnMainThread(delegate
                 {
-                    statusMenuItem.Title = "状态：" + status.Replace("DeepSeek Harness — ", "");
+                    statusMenuItem.Title = "状态：" + status.Replace("DSH Tray — ", "");
                 });
             };
             c.UpdateProgressStarted = delegate
             {
                 app.BeginInvokeOnMainThread(delegate
                 {
-                    progressDismissedByUser = false;
-                    progressIsCompleted = false;
+                    logDismissedByUser = false;
+                    logIsCompleted = false;
+                    ShowLogPanel();
                 });
             };
             c.UpdateProgressChanged = delegate (string stage, string detail)
             {
-                app.BeginInvokeOnMainThread(delegate { UpdateProgressWindow(stage, detail); });
+                app.BeginInvokeOnMainThread(delegate { LogUpdate(stage, detail); });
             };
             c.UpdateProgressCompleted = delegate
             {
-                app.BeginInvokeOnMainThread(CompleteProgressWindow);
+                app.BeginInvokeOnMainThread(delegate
+                {
+                    logIsCompleted = true;
+                    ShowLogPanel();
+                    ScheduleLogHide(2000);
+                });
             };
             c.SelfUpdateAvailable = delegate (string tag, string downloadUrl, string releaseUrl)
             {
@@ -315,7 +333,7 @@ namespace DshTray
                 NSWindowStyle.Titled | NSWindowStyle.Closable,
                 NSBackingStore.Buffered,
                 false);
-            progressPanel.Title = "DeepSeek Harness 更新";
+            progressPanel.Title = "DSH Tray 更新";
             progressPanel.ReleasedWhenClosed = false;
             progressPanel.FloatingPanel = true;
             progressPanel.HidesOnDeactivate = false;
@@ -470,6 +488,119 @@ namespace DshTray
             }
         }
 
+        // ---- Startup/service log panel (separate from the update window) ----
+
+        private static void LogNotify(string text)
+        {
+            AppendLogLine(text);
+            EnsureLogPanel();
+            RefreshLogView2();
+            ShowLogPanel();
+            ScheduleLogHide(6000);
+        }
+
+        private static void LogUpdate(string stage, string detail)
+        {
+            if (!string.IsNullOrEmpty(stage)) currentLogStage = stage;
+            if (!string.IsNullOrWhiteSpace(detail)) AppendLogLine(detail);
+            EnsureLogPanel();
+            if (logStatusLabel != null) logStatusLabel.StringValue = currentLogStage;
+            RefreshLogView2();
+            ShowLogPanel();
+            ScheduleLogHide(6000);
+        }
+
+        private static void EnsureLogPanel()
+        {
+            if (logPanel != null) return;
+
+            logPanel = new NSPanel(
+                new CGRect(0, 0, 500, 300),
+                NSWindowStyle.Titled | NSWindowStyle.Closable,
+                NSBackingStore.Buffered,
+                false);
+            logPanel.Title = "DSH Tray 日志";
+            logPanel.ReleasedWhenClosed = false;
+            logPanel.FloatingPanel = true;
+            logPanel.HidesOnDeactivate = false;
+            logPanel.WillClose += delegate { logDismissedByUser = true; };
+
+            NSTextField title = CreateLabel(new CGRect(24, 254, 452, 30), "启动日志", 15);
+            logStatusLabel = CreateLabel(new CGRect(24, 226, 452, 24), currentLogStage, 13);
+
+            logScroll = new NSScrollView(new CGRect(24, 70, 452, 148));
+            logScroll.HasVerticalScroller = true;
+            logScroll.BorderType = NSBorderType.BezelBorder;
+            logView = new NSTextView(new CGRect(0, 0, 452, 148));
+            logView.Editable = false;
+            logView.Selectable = true;
+            logView.Font = NSFont.SystemFontOfSize(11);
+            logView.DrawsBackground = false;
+            logScroll.DocumentView = logView;
+
+            NSButton logButton = new NSButton(new CGRect(276, 24, 96, 32));
+            logButton.Title = "查看日志";
+            logButton.BezelStyle = NSBezelStyle.Rounded;
+            logButton.Activated += delegate { core.OpenLog(); };
+
+            NSButton hideButton = new NSButton(new CGRect(380, 24, 96, 32));
+            hideButton.Title = "后台运行";
+            hideButton.BezelStyle = NSBezelStyle.Rounded;
+            hideButton.Activated += delegate
+            {
+                logDismissedByUser = true;
+                logPanel.OrderOut(null);
+            };
+
+            logPanel.ContentView.AddSubview(title);
+            logPanel.ContentView.AddSubview(logStatusLabel);
+            logPanel.ContentView.AddSubview(logScroll);
+            logPanel.ContentView.AddSubview(logButton);
+            logPanel.ContentView.AddSubview(hideButton);
+            logPanel.Center();
+        }
+
+        private static void ShowLogPanel()
+        {
+            EnsureLogPanel();
+            if (logPanel != null && !logDismissedByUser) logPanel.OrderFrontRegardless();
+        }
+
+        private static void ScheduleLogHide(int delayMs)
+        {
+            int generation = ++logHideGeneration;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                Thread.Sleep(delayMs);
+                NSApplication.SharedApplication.BeginInvokeOnMainThread(delegate
+                {
+                    if (logPanel == null || logDismissedByUser) return;
+                    if (generation != logHideGeneration) return;
+                    logPanel.OrderOut(null);
+                });
+            });
+        }
+
+        private static void AppendLogLine(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return;
+            string line = text.Trim();
+            if (line.Length > 220) line = line.Substring(0, 217) + "...";
+            if (logLines.Count > 0 && logLines[logLines.Count - 1] == line) return;
+            logLines.Add(line);
+            if (logLines.Count > MaxLogLines)
+                logLines.RemoveRange(0, logLines.Count - MaxLogLines);
+        }
+
+        private static void RefreshLogView2()
+        {
+            if (logView == null) return;
+            string text = string.Join("\n", logLines);
+            logView.Value = text;
+            if (text.Length > 0)
+                logView.ScrollRangeToVisible(new NSRange((nint)text.Length, 0));
+        }
+
         private static NSImage LoadImage()
         {
             try
@@ -509,7 +640,11 @@ namespace DshTray
             public void OpenLog(NSObject sender) { core.OpenLog(); }
 
             [Export("showProgress:")]
-            public void ShowProgress(NSObject sender) { ShowProgressWindow(); }
+            public void ShowProgress(NSObject sender)
+            {
+                logDismissedByUser = false;
+                ShowLogPanel();
+            }
 
             [Export("restartServer:")]
             public void RestartServer(NSObject sender) { core.RestartServer(); }

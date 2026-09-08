@@ -1,10 +1,10 @@
-﻿#!/bin/bash
+#!/bin/bash
 # Package the macOS build into a .app bundle and a DMG.
 # Usage: package-macos.sh <rid> <version>
 set -euo pipefail
 
 RID="$1"
-VERSION="${2:-0.1.17}"
+VERSION="${2:-0.2.0}"
 
 BASE="bin/Release/net10.0-macos"
 APP="dsh-tray.app"
@@ -41,7 +41,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <plist version="1.0">
 <dict>
   <key>CFBundleName</key><string>dsh-tray</string>
-  <key>CFBundleDisplayName</key><string>DeepSeek Harness Tray</string>
+  <key>CFBundleDisplayName</key><string>DSH Tray</string>
   <key>CFBundleIdentifier</key><string>io.dshtray.app</string>
   <key>CFBundleVersion</key><string>${VERSION}</string>
   <key>CFBundleShortVersionString</key><string>${VERSION}</string>

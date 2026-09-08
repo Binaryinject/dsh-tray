@@ -1,6 +1,6 @@
-﻿; dsh-tray Windows installer (per-user, no admin/UAC required)
-#define MyAppName "DeepSeek Harness Tray"
-#define MyAppVersion "0.1.17"
+; dsh-tray Windows installer (per-user, no admin/UAC required)
+#define MyAppName "DSH Tray"
+#define MyAppVersion "0.2.0"
 #define MyAppPublisher "dsh-tray"
 #define MyAppExeName "dsh-tray.exe"
 
@@ -9,7 +9,7 @@ AppId={{C2E7A0B4-5D1F-4A6E-9B3C-8F0D2A5E6C7B}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-DefaultDirName={localappdata}\Programs\DeepSeek Harness Tray
+DefaultDirName={localappdata}\Programs\DSH Tray
 OutputBaseFilename=dsh-tray-setup
 OutputDir=.
 Compression=lzma2
