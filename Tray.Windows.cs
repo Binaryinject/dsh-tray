@@ -1235,7 +1235,12 @@ namespace DshTray
             int y = wr.Top + menuItemTops[index];
             int screenW = GetSystemMetrics(SM_CXSCREEN);
             int screenH = GetSystemMetrics(SM_CYSCREEN);
-            if (x + width > screenW) x = wr.Left - width + 2;
+            // No room to the right: slide left just enough to stay on screen
+            // instead of flipping to the far side of the parent menu. A wide
+            // submenu (the branch list carries each branch's version) used to
+            // land left of the parent menu, far from the pointer, where it
+            // reads as "the submenu never opened".
+            if (x + width > screenW) x = screenW - width - 2;
             if (x < 0) x = 0;
             if (y + height > screenH) y = screenH - height;
             if (y < 0) y = 0;

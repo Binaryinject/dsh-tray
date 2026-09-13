@@ -18,7 +18,7 @@ DeepSeek Harness 的原生托盘启动器。它负责启动 DSH Web 服务、等
 - 启动、下载、安装和退出状态通知
 - 托盘菜单：显示当前版本与 dsh 版本分支、打开界面、启动 dsh 控制台、查看日志、重启服务、退出
 - 启动时先检查更新（自绘对话框）：选择「立即更新」则先更新、服务不启动，安装重启后自动开启服务
-- 重启服务前自动关闭所有 DSH Chrome App 窗口（不触碰其它 Chrome 窗口）
+- 重启服务前自动关闭所有 DSH Chrome App 窗口（按窗口识别，不依赖进程命令行：进程必须是 `chrome.exe`、窗口类必须是 `Chrome_WidgetWin_1`、标题必须是 DSH 标题或本端口 URL；同一个 Chrome 实例里的其它标签页不受影响）
 - 单实例和命名管道控制
 - NativeAOT 单文件发布，不需要安装 .NET Runtime
 - dsh 版本分支可选（latest / next / alpha），托盘菜单一键切换，切换后自动重启服务
@@ -39,6 +39,8 @@ dotnet publish -c Release -r win-x64
 产物：`bin\\Release\\net10.0-windows\\win-x64\\publish\\dsh-tray.exe`
 
 也可以运行仓库中的 `NativeAot.bat`。
+
+构建完成后，双击 `install-local.bat` 可以把新构建覆盖到已安装位置并自动重启托盘。脚本会先停掉正在运行的托盘：运行中的 exe 被 Windows 锁定无法覆盖，而且单实例机制会让新启动的实例只是请求旧实例重开窗口。注意停托盘会一并关闭 DSH App 窗口并停止 dsh 服务，脚本结束时会重新启动。
 
 ### macOS
 
