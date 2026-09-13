@@ -83,6 +83,9 @@ namespace DshTray
         private const int SW_HIDE = 0;
         private const int SW_SHOW = 5;
         private const int SW_SHOWNOACTIVATE = 4;
+        private const uint SWP_NOACTIVATE = 0x0010;
+        private const uint SWP_SHOWWINDOW = 0x0040;
+        private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
         private const int SM_CXSCREEN = 0;
         private const int SM_CYSCREEN = 1;
         private const int IDC_HAND = 32649;
@@ -1235,23 +1238,28 @@ namespace DshTray
             int y = wr.Top + menuItemTops[index];
             int screenW = GetSystemMetrics(SM_CXSCREEN);
             int screenH = GetSystemMetrics(SM_CYSCREEN);
-            // No room to the right: slide left just enough to stay on screen
-            // instead of flipping to the far side of the parent menu. A wide
-            // submenu (the branch list carries each branch's version) used to
-            // land left of the parent menu, far from the pointer, where it
-            // reads as "the submenu never opened".
-            if (x + width > screenW) x = screenW - width - 2;
+            // No room to the right: cascade to the left side of the parent menu
+            // (classic behaviour). A submenu opened there used to stay invisible,
+            // so OpenSubmenu raises the window as the front-most topmost window
+            // below -- a left-side submenu must never end up behind the parent
+            // menu or another window.
+            if (x + width > screenW) x = wr.Left - width + 2;
             if (x < 0) x = 0;
             if (y + height > screenH) y = screenH - height;
             if (y < 0) y = 0;
 
-            MoveWindow(menuSubHwnd, x, y, width, height, false);
             SetRoundedWindowRegion(menuSubHwnd, width, height);
             subMenuOpen = true;
             openedSubmenuIndex = index;
             subMenuHoverIndex = -1;
             InvalidateRect(menuSubHwnd, IntPtr.Zero, false);
-            ShowWindow(menuSubHwnd, SW_SHOWNOACTIVATE);
+            // Show it as the front-most topmost window: when the screen is too
+            // narrow on the right the submenu overlaps the parent menu, and a
+            // plain ShowWindow left it painted behind the parent -- a submenu
+            // that reads as covered / cut off. Both submenus (branch list and
+            // profile list) are opened here, so they behave identically.
+            SetWindowPos(menuSubHwnd, HWND_TOPMOST, x, y, width, height,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW);
         }
 
         private static bool PointInWindow(IntPtr win, POINT pt)
@@ -2258,13 +2266,14 @@ namespace DshTray
             }
             if (string.IsNullOrEmpty(downloadUrl)) return;
 
-            int result = MessageBox(hwnd,
-                "发现新版本 " + tag + "（当前 " + SelfUpdater.GetCurrentVersion() + "）。\n是否下载并自动更新？",
-                "DeepSeek Harness 更新",
-                0x00000004 /* MB_YESNO */ | 0x00000020 /* MB_ICONQUESTION */);
-            if (result == 6 /* IDYES */)
+            // Same skinned dialog the startup check uses, so an update offered
+            // after a restart looks identical to the one offered at launch.
+            Version current = SelfUpdater.TryParseVersion(SelfUpdater.GetCurrentVersion());
+            if (current == null) return;
+            int choice = ShowUpdatePromptDialog(tag, current);
+            if (choice == 0 /* 立即更新 */)
             {
-                SetUpdateProgressUI(0, "准备下载…");
+                SetUpdateProgressUI(0, "开始下载更新…");
                 core.BeginSelfUpdateDownload(downloadUrl);
             }
         }
@@ -3287,6 +3296,10 @@ namespace DshTray
 
         [DllImport("user32.dll")]
         private static extern bool MoveWindow(IntPtr hWnd, int x, int y, int nWidth, int nHeight, bool bRepaint);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter,
+            int x, int y, int cx, int cy, uint uFlags);
 
         [DllImport("user32.dll")]
         private static extern bool SetWindowRgn(IntPtr hWnd, IntPtr hRgn, bool bRedraw);

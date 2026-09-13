@@ -1132,6 +1132,11 @@ namespace DshTray
             StartServer();
             StartPortWatcher();
             Log("[restart] server restarted");
+
+            // A restart is also a natural moment to look for a tray update: the
+            // user is already waiting on the service. This runs in the
+            // background and reports through the platform's update prompt.
+            CheckSelfUpdateAsync();
         }
 
 #if WINDOWS

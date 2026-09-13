@@ -1,6 +1,6 @@
 ; dsh-tray Windows installer (per-user, no admin/UAC required)
 #define MyAppName "DSH Tray"
-#define MyAppVersion "0.2.2"
+#define MyAppVersion "0.2.3"
 #define MyAppPublisher "dsh-tray"
 #define MyAppExeName "dsh-tray.exe"
 
